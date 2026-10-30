@@ -1,6 +1,6 @@
 - insert:
     - id: jenkins
-      name: '@local/dsh-jenkins'
+      name: 'dsh-jenkins-panel'
       config:
         baseUrl: ''
         username: ''

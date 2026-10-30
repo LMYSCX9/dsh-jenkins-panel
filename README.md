@@ -35,10 +35,10 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 dsh-jenkins-panel@1.0.0
 
 # git（推荐钉 commit，不要用分支名）
-git+https://github.com/<owner>/<repo>.git#<commit-sha>
+git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
 
 # 本地目录
-<绝对路径>/dsh-jenkins
+<本地路径>/dsh-plugin-jenkins
 ```
 
 装完在 DSH Web 左栏出现一个齿轮图标，点开即面板。

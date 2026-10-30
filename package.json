@@ -1,11 +1,10 @@
 {
-  "name": "@local/dsh-jenkins",
+  "name": "dsh-jenkins-panel",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
   "description": "Jenkins panel in the DSH sidebar: connect a Jenkins server, browse jobs, inspect the build queue, and trigger builds.",
   "license": "MIT",
-  "author": "ELAscx",
+  "author": "LMYSCX9",
   "keywords": [
     "dsh",
     "dsh-plugin",
@@ -15,7 +14,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ELAscx/dsh-jenkins-panel.git"
+    "url": "git+https://github.com/LMYSCX9/dsh-jenkins-panel.git"
   },
   "exports": {
     ".": "./index.js",

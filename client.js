@@ -6,7 +6,7 @@
  * `/dsh-jenkins` HTTP route registered by index.js.
  */
 window.__ModuleLoader__.load({
-  id: '@local/dsh-jenkins',
+  id: 'dsh-jenkins-panel',
   factory(require) {
     const React = require('react')
     const h = React.createElement
