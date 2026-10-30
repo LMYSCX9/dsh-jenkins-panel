@@ -1,0 +1,9 @@
+- insert:
+    - id: jenkins
+      name: '@local/dsh-jenkins'
+      config:
+        baseUrl: ''
+        username: ''
+        token: ''
+        insecureTls: true
+        jobFilter: ''

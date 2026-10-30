@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Jenkins",
+    "description": "Connect a Jenkins server from the sidebar to browse jobs, watch the build queue, and trigger builds."
+  }
+}

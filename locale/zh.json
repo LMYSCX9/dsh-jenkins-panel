@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Jenkins",
+    "description": "在左侧栏连接 Jenkins 服务器，查询任务、查看构建队列并触发构建。"
+  }
+}

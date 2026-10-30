@@ -1,0 +1,862 @@
+/**
+ * Client half of the Jenkins plugin.
+ *
+ * Registers the sidebar icon under `sidebar.panellist` (whose list id addresses the
+ * `main` panel slot), and renders the Jenkins page. Host work happens behind the
+ * `/dsh-jenkins` HTTP route registered by index.js.
+ */
+window.__ModuleLoader__.load({
+  id: '@local/dsh-jenkins',
+  factory(require) {
+    const React = require('react')
+    const h = React.createElement
+    const { useCallback, useEffect, useMemo, useRef, useState } = React
+
+    const ROUTE = '/dsh-jenkins'
+
+    /* ------------------------------------------------------------------ i18n */
+
+    const STRINGS = {
+      zh: {
+        nav: 'Jenkins',
+        title: 'Jenkins',
+        subtitle: '连接 Jenkins，查询任务并触发构建',
+        connected: '已连接',
+        notConnected: '未连接',
+        connectHint: '尚未配置 Jenkins 地址',
+        connection: '连接设置',
+        collapse: '收起',
+        expand: '展开',
+        baseUrl: 'Jenkins 地址',
+        baseUrlPlaceholder: 'http://ci.example.com:8080 或 http://host/jenkins',
+        username: '用户名',
+        usernamePlaceholder: 'Jenkins 账号',
+        token: 'API Token',
+        tokenPlaceholder: '粘贴令牌',
+        tokenSaved: '已保存，留空表示不修改',
+        insecureTls: '信任自签名证书（HTTPS）',
+        jobFilter: '任务过滤（可选）',
+        jobFilterPlaceholder: '只显示名称包含此文本的任务',
+        saveAndConnect: '保存并连接',
+        saving: '保存中…',
+        testing: '测试中…',
+        test: '测试连接',
+        clearToken: '清除 Token',
+        settingsPath: '凭据保存在',
+        jobs: '任务',
+        queue: '构建队列',
+        search: '搜索任务…',
+        refresh: '刷新',
+        refreshing: '刷新中…',
+        empty: '暂无任务',
+        emptyHint: '填写连接信息后点击「保存并连接」。',
+        noMatch: '没有匹配的任务',
+        build: '构建',
+        building: '构建中…',
+        history: '历史',
+        hideHistory: '收起',
+        noBuilds: '没有构建记录',
+        noBuild: '暂无构建',
+        queueEmpty: '队列为空',
+        waiting: '排队中',
+        blocked: '被阻塞',
+        buildStarted: '已提交构建',
+        buildQueuedAt: '构建已进入队列',
+        testOk: '连接成功',
+        saved: '设置已保存',
+        loading: '加载中…',
+        success: '成功',
+        failure: '失败',
+        unstable: '不稳定',
+        aborted: '已中断',
+        buildingNow: '构建中',
+        notBuilt: '未构建',
+        disabled: '已禁用',
+        unknown: '未知',
+        idle: '空闲',
+        justNow: '刚刚',
+        minutesAgo: '{n} 分钟前',
+        hoursAgo: '{n} 小时前',
+        daysAgo: '{n} 天前',
+        seconds: '{n} 秒',
+      },
+      en: {
+        nav: 'Jenkins',
+        title: 'Jenkins',
+        subtitle: 'Connect a Jenkins server, browse jobs, and trigger builds',
+        connected: 'Connected',
+        notConnected: 'Not connected',
+        connectHint: 'No Jenkins URL configured yet',
+        connection: 'Connection',
+        collapse: 'Collapse',
+        expand: 'Edit',
+        baseUrl: 'Jenkins URL',
+        baseUrlPlaceholder: 'http://ci.example.com:8080 or http://host/jenkins',
+        username: 'User name',
+        usernamePlaceholder: 'Jenkins account',
+        token: 'API token',
+        tokenPlaceholder: 'Paste token',
+        tokenSaved: 'Saved — leave empty to keep it',
+        insecureTls: 'Trust self-signed certificates (HTTPS)',
+        jobFilter: 'Job filter (optional)',
+        jobFilterPlaceholder: 'Only list jobs whose name contains this',
+        saveAndConnect: 'Save and connect',
+        saving: 'Saving…',
+        testing: 'Testing…',
+        test: 'Test connection',
+        clearToken: 'Clear token',
+        settingsPath: 'Credentials are stored in',
+        jobs: 'Jobs',
+        queue: 'Build queue',
+        search: 'Search jobs…',
+        refresh: 'Refresh',
+        refreshing: 'Refreshing…',
+        empty: 'No jobs',
+        emptyHint: 'Fill in the connection details and choose “Save and connect”.',
+        noMatch: 'No matching job',
+        build: 'Build',
+        building: 'Starting…',
+        history: 'History',
+        hideHistory: 'Hide',
+        noBuilds: 'No build records',
+        noBuild: 'No build yet',
+        queueEmpty: 'The queue is empty',
+        waiting: 'Waiting',
+        blocked: 'Blocked',
+        buildStarted: 'Build submitted',
+        buildQueuedAt: 'Build queued',
+        testOk: 'Connection succeeded',
+        saved: 'Settings saved',
+        loading: 'Loading…',
+        success: 'Success',
+        failure: 'Failure',
+        unstable: 'Unstable',
+        aborted: 'Aborted',
+        buildingNow: 'Building',
+        notBuilt: 'Not built',
+        disabled: 'Disabled',
+        unknown: 'Unknown',
+        idle: 'Idle',
+        justNow: 'just now',
+        minutesAgo: '{n} min ago',
+        hoursAgo: '{n} h ago',
+        daysAgo: '{n} d ago',
+        seconds: '{n}s',
+      },
+    }
+
+    let localeService = null
+    let activeLocale = 'en'
+
+    function syncLocale() {
+      try {
+        const snapshot = localeService && typeof localeService.getLocale === 'function' ? localeService.getLocale() : null
+        const id = snapshot && typeof snapshot.active === 'string' ? snapshot.active.toLowerCase() : ''
+        activeLocale = id.startsWith('zh') ? 'zh' : 'en'
+      } catch {
+        activeLocale = 'en'
+      }
+    }
+
+    function t(key, vars) {
+      const dict = STRINGS[activeLocale] || STRINGS.en
+      let text = dict[key]
+      if (text === undefined) text = STRINGS.en[key]
+      if (text === undefined) text = key
+      if (vars) {
+        for (const name of Object.keys(vars)) text = text.split(`{${name}}`).join(String(vars[name]))
+      }
+      return text
+    }
+
+    function useLocale() {
+      const [, bump] = useState(0)
+      useEffect(() => {
+        syncLocale()
+        bump((n) => n + 1)
+        if (!localeService || typeof localeService.subscribe !== 'function') return undefined
+        let dispose = null
+        try {
+          dispose = localeService.subscribe(() => {
+            syncLocale()
+            bump((n) => n + 1)
+          })
+        } catch {
+          dispose = null
+        }
+        return () => {
+          if (typeof dispose === 'function') {
+            try {
+              dispose()
+            } catch {
+              /* already gone */
+            }
+          }
+        }
+      }, [])
+      syncLocale()
+    }
+
+    /* ------------------------------------------------------------------- api */
+
+    async function callApi(path, body) {
+      const init = body === undefined
+        ? { method: 'GET', headers: { accept: 'application/json' } }
+        : {
+            method: 'POST',
+            headers: { accept: 'application/json', 'content-type': 'application/json' },
+            body: JSON.stringify(body),
+          }
+      let response
+      try {
+        response = await fetch(`${ROUTE}${path}`, init)
+      } catch (error) {
+        throw new Error(`无法访问插件接口：${error && error.message ? error.message : error}`)
+      }
+      const text = await response.text()
+      let data = null
+      try {
+        data = text ? JSON.parse(text) : null
+      } catch {
+        throw new Error(`插件接口返回了非 JSON 内容（HTTP ${response.status}）`)
+      }
+      if (!response.ok && (!data || typeof data !== 'object')) {
+        throw new Error(`插件接口请求失败（HTTP ${response.status}）`)
+      }
+      return data || {}
+    }
+
+    /* --------------------------------------------------------------- helpers */
+
+    function stateOf(color) {
+      const value = String(color || 'grey')
+      const building = value.endsWith('_anime')
+      const base = building ? value.slice(0, -'_anime'.length) : value
+      let state = 'idle'
+      if (base.startsWith('disabled')) state = 'disabled'
+      else if (base.startsWith('blue')) state = 'success'
+      else if (base.startsWith('red')) state = 'failure'
+      else if (base.startsWith('yellow')) state = 'unstable'
+      else if (base.startsWith('aborted')) state = 'aborted'
+      else if (base === 'notbuilt') state = 'idle'
+      if (building) return 'running'
+      return state
+    }
+
+    function resultLabel(result, building) {
+      if (building) return t('buildingNow')
+      if (!result) return t('notBuilt')
+      switch (result) {
+        case 'SUCCESS':
+          return t('success')
+        case 'FAILURE':
+          return t('failure')
+        case 'UNSTABLE':
+          return t('unstable')
+        case 'ABORTED':
+          return t('aborted')
+        default:
+          return result
+      }
+    }
+
+    function formatRelative(timestamp) {
+      if (!timestamp) return ''
+      const delta = Date.now() - timestamp
+      if (delta < 45 * 1000) return t('justNow')
+      const minutes = Math.round(delta / 60000)
+      if (minutes < 60) return t('minutesAgo', { n: minutes })
+      const hours = Math.round(minutes / 60)
+      if (hours < 24) return t('hoursAgo', { n: hours })
+      return t('daysAgo', { n: Math.round(hours / 24) })
+    }
+
+    function formatDuration(ms) {
+      if (!ms || ms < 0) return ''
+      const seconds = Math.round(ms / 1000)
+      if (seconds < 60) return t('seconds', { n: seconds })
+      const minutes = Math.floor(seconds / 60)
+      const rest = seconds % 60
+      return `${minutes}m ${rest}s`
+    }
+
+    /* --------------------------------------------------------------- styling */
+
+    const CSS = `
+.djl-root { height: 100%; overflow: auto; box-sizing: border-box; padding: 28px 24px 56px;
+  background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-primary);
+  font-family: inherit; font-size: 13px; line-height: 1.5; }
+.djl-inner { max-width: 900px; margin: 0 auto; display: flex; flex-direction: column; gap: 16px; }
+.djl-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.djl-title { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+.djl-sub { margin: 4px 0 0; font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.djl-head-right { display: flex; align-items: center; gap: 8px; }
+.djl-chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+  border-radius: 999px; font-size: 12px; border: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-1); color: var(--dsw-alias-label-secondary); white-space: nowrap; }
+.djl-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
+.djl-chip[data-on="true"] .djl-chip-dot { background: var(--dsw-alias-state-success-primary); }
+.djl-card { background: var(--dsw-alias-bg-layer-1); border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 12px; overflow: hidden; }
+.djl-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
+.djl-card-head h2 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.djl-count { font-weight: 400; color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.djl-card-body { padding: 16px; }
+.djl-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+.djl-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.djl-field > span { font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.djl-span2 { grid-column: 1 / -1; }
+.djl-input { height: 32px; padding: 0 10px; font-size: 13px; font-family: inherit;
+  color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; outline: none; min-width: 0; }
+.djl-input:focus { border-color: var(--dsw-alias-brand-primary); }
+.djl-input::placeholder { color: var(--dsw-alias-label-secondary); opacity: 0.8; }
+.djl-check { display: flex; align-items: center; gap: 8px; font-size: 12px;
+  color: var(--dsw-alias-label-secondary); grid-column: 1 / -1; }
+.djl-check input { accent-color: var(--dsw-alias-brand-primary); }
+.djl-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; grid-column: 1 / -1; }
+.djl-btn { height: 30px; padding: 0 14px; border-radius: 8px; font-size: 12px; font-family: inherit;
+  cursor: pointer; border: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-2); color: var(--dsw-alias-label-primary);
+  transition: border-color 120ms ease, opacity 120ms ease; }
+.djl-btn:hover:not(:disabled) { border-color: var(--dsw-alias-border-l2); }
+.djl-btn:disabled { opacity: 0.55; cursor: default; }
+.djl-btn-primary { background: var(--dsw-alias-brand-primary); border-color: transparent; color: #fff; }
+.djl-btn-quiet { background: transparent; color: var(--dsw-alias-label-secondary); }
+.djl-hint { margin: 0; grid-column: 1 / -1; font-size: 11px; color: var(--dsw-alias-label-secondary);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djl-banner { border-radius: 10px; padding: 10px 14px; font-size: 12px; border: 1px solid; }
+.djl-banner[data-kind="error"] { color: var(--dsw-alias-state-error-primary);
+  border-color: var(--dsw-alias-state-error-primary); background: transparent; }
+.djl-banner[data-kind="ok"] { color: var(--dsw-alias-state-success-primary);
+  border-color: var(--dsw-alias-state-success-primary); background: transparent; }
+.djl-search { height: 28px; width: 200px; max-width: 40vw; padding: 0 10px; font-size: 12px;
+  font-family: inherit; color: var(--dsw-alias-label-primary); background: var(--dsw-alias-bg-base);
+  border: 1px solid var(--dsw-alias-border-l1); border-radius: 8px; outline: none; }
+.djl-search:focus { border-color: var(--dsw-alias-brand-primary); }
+.djl-list { list-style: none; margin: 0; padding: 0; }
+.djl-job { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center;
+  gap: 10px; padding: 9px 16px; border-top: 1px solid var(--dsw-alias-border-l1); }
+.djl-job:first-child { border-top: none; }
+.djl-job:hover { background: var(--dsw-alias-bg-layer-2); }
+.djl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); }
+.djl-dot[data-state="success"] { background: var(--dsw-alias-state-success-primary); }
+.djl-dot[data-state="failure"] { background: var(--dsw-alias-state-error-primary); }
+.djl-dot[data-state="unstable"] { background: var(--dsw-alias-state-warn-primary); }
+.djl-dot[data-state="running"] { background: var(--dsw-alias-brand-primary); }
+.djl-dot[data-state="disabled"] { background: var(--dsw-alias-border-l2); }
+.djl-job-main { min-width: 0; }
+.djl-job-name { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djl-job-meta { font-size: 11px; color: var(--dsw-alias-label-secondary); margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djl-job-actions { display: flex; align-items: center; gap: 6px; }
+.djl-job-actions .djl-btn { height: 26px; padding: 0 10px; font-size: 12px; }
+.djl-builds { grid-column: 1 / -1; padding: 4px 0 6px 20px; }
+.djl-build-row { display: flex; align-items: center; gap: 10px; font-size: 11px;
+  color: var(--dsw-alias-label-secondary); padding: 3px 0; }
+.djl-build-num { color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; min-width: 44px; }
+.djl-empty { padding: 22px 16px; text-align: center; color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.djl-queue-row { display: flex; align-items: baseline; gap: 10px; padding: 7px 16px;
+  border-top: 1px solid var(--dsw-alias-border-l1); font-size: 12px; }
+.djl-queue-row:first-child { border-top: none; }
+.djl-queue-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djl-queue-why { color: var(--dsw-alias-label-secondary); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djl-busy { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px;
+  border: 1.5px solid var(--dsw-alias-border-l2); border-top-color: var(--dsw-alias-brand-primary);
+  border-radius: 50%; animation: djl-spin 700ms linear infinite; }
+@keyframes djl-spin { to { transform: rotate(360deg); } }
+@media (max-width: 640px) { .djl-form { grid-template-columns: 1fr; } .djl-root { padding: 18px 14px 40px; } }
+`
+
+    /* --------------------------------------------------------------- sidebar */
+
+    function JenkinsIcon(props) {
+      const size = props && typeof props.size === 'number' ? props.size : 20
+      const active = !!(props && props.active)
+      return h(
+        'svg',
+        {
+          viewBox: '0 0 24 24',
+          width: size,
+          height: size,
+          'aria-hidden': true,
+          focusable: 'false',
+          style: { display: 'block', color: active ? 'var(--dsw-alias-brand-primary)' : 'currentColor' },
+        },
+        h('path', {
+          d: 'M12 2.75v3M12 18.25v3M2.75 12h3M18.25 12h3M5.4 5.4l2.1 2.1M16.5 16.5l2.1 2.1M18.6 5.4l-2.1 2.1M7.5 16.5l-2.1 2.1',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.6,
+          strokeLinecap: 'round',
+        }),
+        h('circle', { cx: 12, cy: 12, r: 4.6, fill: 'none', stroke: 'currentColor', strokeWidth: 1.6 }),
+        h('circle', { cx: 12, cy: 12, r: 1.5, fill: 'currentColor' }),
+      )
+    }
+
+    /* ----------------------------------------------------------------- panel */
+
+    function JenkinsPanel() {
+      useLocale()
+
+      const [loading, setLoading] = useState(true)
+      const [busy, setBusy] = useState('')
+      const [banner, setBanner] = useState(null)
+      const [settings, setSettings] = useState({ baseUrl: '', username: '', hasToken: false, insecureTls: true, jobFilter: '', settingsFile: '', configured: false })
+      const [form, setForm] = useState({ baseUrl: '', username: '', token: '', insecureTls: true, jobFilter: '' })
+      const [editing, setEditing] = useState(true)
+      const [jobs, setJobs] = useState([])
+      const [queue, setQueue] = useState([])
+      const [search, setSearch] = useState('')
+      const [expanded, setExpanded] = useState('')
+      const [builds, setBuilds] = useState({})
+      const [busyJob, setBusyJob] = useState('')
+      const timerRef = useRef(null)
+
+      const remember = useCallback((next) => {
+        setSettings(next)
+        setForm((current) => ({
+          baseUrl: next.baseUrl || '',
+          username: next.username || '',
+          token: '',
+          insecureTls: next.insecureTls !== false,
+          jobFilter: next.jobFilter || '',
+        }))
+        setEditing(!next.configured)
+      }, [])
+
+      const loadJobs = useCallback(async () => {
+        const result = await callApi('/jobs', {})
+        if (!result.ok) throw new Error(result.error || '读取任务列表失败')
+        setJobs(Array.isArray(result.jobs) ? result.jobs : [])
+        return result
+      }, [])
+
+      const loadQueue = useCallback(async () => {
+        try {
+          const result = await callApi('/queue', {})
+          if (result.ok && Array.isArray(result.items)) setQueue(result.items)
+        } catch {
+          /* the queue is secondary: keep the page usable when only it fails */
+        }
+      }, [])
+
+      const bootstrap = useCallback(async () => {
+        setLoading(true)
+        try {
+          const state = await callApi('/state')
+          const next = state.settings || {}
+          remember(next)
+          if (next.configured) {
+            await Promise.all([loadJobs().catch((error) => setBanner({ kind: 'error', text: error.message })), loadQueue()])
+          }
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setLoading(false)
+        }
+      }, [remember, loadJobs, loadQueue])
+
+      useEffect(() => {
+        void bootstrap()
+        return () => {
+          if (timerRef.current) {
+            clearTimeout(timerRef.current)
+            timerRef.current = null
+          }
+        }
+      }, [bootstrap])
+
+      const save = useCallback(async (event) => {
+        if (event) event.preventDefault()
+        setBusy('save')
+        setBanner(null)
+        try {
+          const payload = {
+            baseUrl: form.baseUrl,
+            username: form.username,
+            insecureTls: form.insecureTls,
+            jobFilter: form.jobFilter,
+          }
+          if (form.token) payload.token = form.token
+          const saved = await callApi('/settings', payload)
+          if (!saved.ok) throw new Error(saved.error || '保存失败')
+          remember(saved.settings)
+          setBanner({ kind: 'ok', text: `${t('saved')} · ${t('settingsPath')} ${saved.settings.settingsFile || ''}` })
+          setBusy('')
+          const test = await callApi('/test', {})
+          if (!test.ok) {
+            setBanner({ kind: 'error', text: test.error || '连接测试失败' })
+            return
+          }
+          setBanner({
+            kind: 'ok',
+            text: `${t('testOk')} · ${test.version ? `Jenkins ${test.version}` : saved.settings.baseUrl} · ${test.latencyMs}ms`,
+          })
+          setBusy('refresh')
+          await Promise.all([loadJobs(), loadQueue()])
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [form, remember, loadJobs, loadQueue])
+
+      const test = useCallback(async () => {
+        setBusy('test')
+        setBanner(null)
+        try {
+          const payload = { baseUrl: form.baseUrl, username: form.username, insecureTls: form.insecureTls, jobFilter: form.jobFilter }
+          if (form.token) payload.token = form.token
+          const saved = await callApi('/settings', payload)
+          if (!saved.ok) throw new Error(saved.error || '保存失败')
+          remember(saved.settings)
+          const result = await callApi('/test', {})
+          if (!result.ok) throw new Error(result.error || '连接测试失败')
+          setBanner({ kind: 'ok', text: `${t('testOk')} · ${result.version ? `Jenkins ${result.version}` : saved.settings.baseUrl} · ${result.latencyMs}ms` })
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [form, remember])
+
+      const clearToken = useCallback(async () => {
+        setBusy('token')
+        try {
+          const saved = await callApi('/settings', { clearToken: true })
+          if (!saved.ok) throw new Error(saved.error || '保存失败')
+          remember(saved.settings)
+          setBanner({ kind: 'ok', text: t('saved') })
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [remember])
+
+      const refresh = useCallback(async () => {
+        setBusy('refresh')
+        setBanner(null)
+        try {
+          await Promise.all([loadJobs(), loadQueue()])
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [loadJobs, loadQueue])
+
+      const trigger = useCallback(async (job) => {
+        setBusyJob(job.name)
+        setBanner(null)
+        try {
+          const result = await callApi('/build', { job: job.name, url: job.url })
+          if (!result.ok) throw new Error(result.error || '触发构建失败')
+          setBanner({ kind: 'ok', text: `${t('buildStarted')} · ${job.name}${result.queueUrl ? ` · ${t('buildQueuedAt')}` : ''}` })
+          if (timerRef.current) clearTimeout(timerRef.current)
+          timerRef.current = setTimeout(() => {
+            void refresh()
+          }, 4000)
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusyJob('')
+        }
+      }, [refresh])
+
+      const toggleHistory = useCallback(async (job) => {
+        if (expanded === job.name) {
+          setExpanded('')
+          return
+        }
+        setExpanded(job.name)
+        if (builds[job.name]) return
+        try {
+          const result = await callApi('/builds', { url: job.url, limit: 8 })
+          if (!result.ok) throw new Error(result.error || '读取构建历史失败')
+          setBuilds((current) => ({ ...current, [job.name]: Array.isArray(result.builds) ? result.builds : [] }))
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        }
+      }, [expanded, builds])
+
+      const filtered = useMemo(() => {
+        const needle = search.trim().toLowerCase()
+        if (!needle) return jobs
+        return jobs.filter((job) => job.name.toLowerCase().includes(needle))
+      }, [jobs, search])
+
+      const chipText = settings.configured
+        ? `${t('connected')} · ${settings.baseUrl.replace(/^https?:\/\//, '')}`
+        : t('connectHint')
+
+      const field = (label, key, options) => {
+        const opts = options || {}
+        return h(
+          'label',
+          { className: `djl-field${opts.wide ? ' djl-span2' : ''}`, key },
+          h('span', null, label),
+          h('input', {
+            className: 'djl-input',
+            type: opts.type || 'text',
+            value: form[key],
+            placeholder: opts.placeholder || '',
+            autoComplete: opts.autoComplete || 'off',
+            spellCheck: false,
+            onChange: (event) => setForm((current) => ({ ...current, [key]: event.target.value })),
+          }),
+        )
+      }
+
+      return h(
+        'div',
+        { className: 'djl-root' },
+        h('style', null, CSS),
+        h(
+          'div',
+          { className: 'djl-inner' },
+          h(
+            'header',
+            { className: 'djl-head' },
+            h(
+              'div',
+              null,
+              h('h1', { className: 'djl-title' }, t('title')),
+              h('p', { className: 'djl-sub' }, t('subtitle')),
+            ),
+            h(
+              'div',
+              { className: 'djl-head-right' },
+              h(
+                'span',
+                { className: 'djl-chip', 'data-on': settings.configured ? 'true' : 'false' },
+                h('span', { className: 'djl-chip-dot' }),
+                chipText,
+              ),
+              h(
+                'button',
+                { className: 'djl-btn', type: 'button', disabled: busy !== '' || !settings.configured, onClick: refresh },
+                busy === 'refresh' ? t('refreshing') : t('refresh'),
+              ),
+            ),
+          ),
+
+          banner
+            ? h('div', { className: 'djl-banner', 'data-kind': banner.kind }, banner.text)
+            : null,
+
+          h(
+            'section',
+            { className: 'djl-card' },
+            h(
+              'div',
+              { className: 'djl-card-head' },
+              h('h2', null, t('connection')),
+              h(
+                'button',
+                { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => setEditing((value) => !value) },
+                editing ? t('collapse') : t('expand'),
+              ),
+            ),
+            editing
+              ? h(
+                  'form',
+                  { className: 'djl-card-body djl-form', onSubmit: save },
+                  field(t('baseUrl'), 'baseUrl', { wide: true, placeholder: t('baseUrlPlaceholder') }),
+                  field(t('username'), 'username', { placeholder: t('usernamePlaceholder'), autoComplete: 'username' }),
+                  h(
+                    'label',
+                    { className: 'djl-field' },
+                    h('span', null, t('token')),
+                    h('input', {
+                      className: 'djl-input',
+                      type: 'password',
+                      value: form.token,
+                      placeholder: settings.hasToken ? t('tokenSaved') : t('tokenPlaceholder'),
+                      autoComplete: 'off',
+                      spellCheck: false,
+                      onChange: (event) => setForm((current) => ({ ...current, token: event.target.value })),
+                    }),
+                  ),
+                  field(t('jobFilter'), 'jobFilter', { wide: true, placeholder: t('jobFilterPlaceholder') }),
+                  h(
+                    'label',
+                    { className: 'djl-check' },
+                    h('input', {
+                      type: 'checkbox',
+                      checked: form.insecureTls,
+                      onChange: (event) => setForm((current) => ({ ...current, insecureTls: event.target.checked })),
+                    }),
+                    t('insecureTls'),
+                  ),
+                  h(
+                    'div',
+                    { className: 'djl-actions' },
+                    h(
+                      'button',
+                      { className: 'djl-btn djl-btn-primary', type: 'submit', disabled: busy !== '' },
+                      busy === 'save' ? t('saving') : t('saveAndConnect'),
+                    ),
+                    h(
+                      'button',
+                      { className: 'djl-btn', type: 'button', disabled: busy !== '', onClick: test },
+                      busy === 'test' ? t('testing') : t('test'),
+                    ),
+                    settings.hasToken
+                      ? h(
+                          'button',
+                          { className: 'djl-btn djl-btn-quiet', type: 'button', disabled: busy !== '', onClick: clearToken },
+                          t('clearToken'),
+                        )
+                      : null,
+                  ),
+                  h('p', { className: 'djl-hint' }, `${t('settingsPath')} ${settings.settingsFile || ''}`),
+                )
+              : null,
+          ),
+
+          h(
+            'section',
+            { className: 'djl-card' },
+            h(
+              'div',
+              { className: 'djl-card-head' },
+              h('h2', null, t('jobs'), h('span', { className: 'djl-count' }, String(jobs.length))),
+              h('input', {
+                className: 'djl-search',
+                value: search,
+                placeholder: t('search'),
+                spellCheck: false,
+                onChange: (event) => setSearch(event.target.value),
+              }),
+            ),
+            loading
+              ? h('div', { className: 'djl-empty' }, t('loading'))
+              : !settings.configured
+                ? h('div', { className: 'djl-empty' }, t('emptyHint'))
+                : filtered.length === 0
+                  ? h('div', { className: 'djl-empty' }, search ? t('noMatch') : t('empty'))
+                  : h(
+                      'ul',
+                      { className: 'djl-list' },
+                      filtered.map((job) => {
+                        const last = job.lastBuild
+                        const open = expanded === job.name
+                        const rows = builds[job.name]
+                        return h(
+                          'li',
+                          { className: 'djl-job', key: job.name },
+                          h('span', { className: 'djl-dot', 'data-state': stateOf(job.color) }),
+                          h(
+                            'div',
+                            { className: 'djl-job-main' },
+                            h('div', { className: 'djl-job-name', title: job.name }, job.name),
+                            h(
+                              'div',
+                              { className: 'djl-job-meta' },
+                              last
+                                ? `#${last.number === null ? '?' : last.number} · ${resultLabel(last.result, last.building)} · ${formatRelative(last.timestamp)}${last.duration ? ` · ${formatDuration(last.duration)}` : ''}`
+                                : t('noBuild'),
+                            ),
+                          ),
+                          h(
+                            'div',
+                            { className: 'djl-job-actions' },
+                            h(
+                              'button',
+                              { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => void toggleHistory(job) },
+                              open ? t('hideHistory') : t('history'),
+                            ),
+                            h(
+                              'button',
+                              {
+                                className: 'djl-btn',
+                                type: 'button',
+                                disabled: busyJob !== '',
+                                onClick: () => void trigger(job),
+                              },
+                              busyJob === job.name ? t('building') : t('build'),
+                            ),
+                          ),
+                          open
+                            ? h(
+                                'div',
+                                { className: 'djl-builds' },
+                                rows === undefined
+                                  ? h('div', { className: 'djl-build-row' }, t('loading'))
+                                  : rows.length === 0
+                                    ? h('div', { className: 'djl-build-row' }, t('noBuilds'))
+                                    : rows.map((build) =>
+                                        h(
+                                          'div',
+                                          { className: 'djl-build-row', key: String(build.number) },
+                                          h('span', { className: 'djl-build-num' }, `#${build.number === null ? '?' : build.number}`),
+                                          h('span', { className: 'djl-dot', 'data-state': build.building ? 'running' : stateOf({ SUCCESS: 'blue', FAILURE: 'red', UNSTABLE: 'yellow', ABORTED: 'aborted' }[build.result] || 'grey') }),
+                                          h('span', null, resultLabel(build.result, build.building)),
+                                          h('span', null, formatRelative(build.timestamp)),
+                                          h('span', null, formatDuration(build.duration)),
+                                        ),
+                                      ),
+                              )
+                            : null,
+                        )
+                      }),
+                    ),
+          ),
+
+          h(
+            'section',
+            { className: 'djl-card' },
+            h(
+              'div',
+              { className: 'djl-card-head' },
+              h('h2', null, t('queue'), h('span', { className: 'djl-count' }, String(queue.length))),
+            ),
+            queue.length === 0
+              ? h('div', { className: 'djl-empty' }, t('queueEmpty'))
+              : h(
+                  'div',
+                  null,
+                  queue.map((item) =>
+                    h(
+                      'div',
+                      { className: 'djl-queue-row', key: String(item.id) },
+                      h('span', { className: 'djl-queue-name', title: item.name }, item.name || '?'),
+                      h('span', { className: 'djl-queue-why' }, item.why || (item.blocked ? t('blocked') : t('waiting'))),
+                    ),
+                  ),
+                ),
+          ),
+        ),
+      )
+    }
+
+    return {
+      inject: ['slots', 'locale'],
+      apply(ctx) {
+        localeService = ctx.locale
+        syncLocale()
+
+        ctx.slots.inject('sidebar.panellist', () =>
+          ctx.slots.register(
+            {
+              name: 'sidebar.panellist',
+              id: 'jenkins',
+              order: 20,
+              label: () => t('nav'),
+            },
+            JenkinsIcon,
+          ),
+        )
+
+        ctx.slots.inject('main', () =>
+          ctx.slots.register({ name: 'main', key: 'jenkins' }, JenkinsPanel),
+        )
+      },
+    }
+  },
+})
