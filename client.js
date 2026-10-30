@@ -28,6 +28,7 @@ window.__ModuleLoader__.load({
         pickJobEmpty: '没有任务',
         pickJobHint: '去面板配置',
         buildSubmitted: '已提交构建',
+        defaultParams: '默认参数',
         connection: '连接设置',
         collapse: '收起',
         expand: '展开',
@@ -95,6 +96,7 @@ window.__ModuleLoader__.load({
         pickJobEmpty: 'No jobs',
         pickJobHint: 'Configure in the panel',
         buildSubmitted: 'Build submitted',
+        defaultParams: 'default parameters',
         connection: 'Connection',
         collapse: 'Collapse',
         expand: 'Edit',
@@ -502,7 +504,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await callApi('/build', { job: job.name, url: job.url })
           if (!result.ok) throw new Error(result.error || '触发构建失败')
-          setNote(`${t('buildSubmitted')} · ${job.name}`)
+          setNote(`${t('buildSubmitted')} · ${job.name}${result.usedDefaults ? ` · ${t('defaultParams')}` : ''}`)
         } catch (caught) {
           setNote(caught && caught.message ? caught.message : String(caught))
         } finally {
@@ -783,7 +785,7 @@ window.__ModuleLoader__.load({
         try {
           const result = await callApi('/build', { job: job.name, url: job.url })
           if (!result.ok) throw new Error(result.error || '触发构建失败')
-          setBanner({ kind: 'ok', text: `${t('buildStarted')} · ${job.name}${result.queueUrl ? ` · ${t('buildQueuedAt')}` : ''}` })
+          setBanner({ kind: 'ok', text: `${t('buildStarted')} · ${job.name}${result.usedDefaults ? ` · ${t('defaultParams')}` : ''}${result.queueUrl ? ` · ${t('buildQueuedAt')}` : ''}` })
           if (timerRef.current) clearTimeout(timerRef.current)
           timerRef.current = setTimeout(() => {
             void refresh()

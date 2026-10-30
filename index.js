@@ -411,8 +411,61 @@ function createJenkins(settings) {
     })
   }
 
+  async function readParameterDefinitions(jobUrl) {
+    const tree = 'property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]'
+    const response = await call(`${ensureTrailingSlash(jobUrl)}api/json?tree=${encodeURIComponent(tree)}`)
+    if (response.status >= 400) return []
+    let data
+    try {
+      data = parseJson(response, '读取参数定义')
+    } catch {
+      return []
+    }
+    const properties = Array.isArray(data.property) ? data.property : []
+    const definitions = []
+    for (const property of properties) {
+      if (!property || !Array.isArray(property.parameterDefinitions)) continue
+      for (const definition of property.parameterDefinitions) {
+        if (!definition || typeof definition.name !== 'string') continue
+        const carrier = definition.defaultParameterValue
+        const value = carrier && typeof carrier === 'object' ? carrier.value : undefined
+        definitions.push({
+          name: definition.name,
+          type: typeof definition.type === 'string' ? definition.type : '',
+          hasDefault: value !== undefined && value !== null,
+          defaultValue: value,
+          choices: Array.isArray(definition.choices) ? definition.choices : undefined,
+        })
+      }
+    }
+    return definitions
+  }
+
+  /** Build the form payload that reproduces each parameter's declared default. */
+  function defaultsFromDefinitions(definitions) {
+    const payload = {}
+    for (const definition of definitions) {
+      // File parameters are multipart-only and cannot be expressed as a form field.
+      if (/FileParameter/i.test(definition.type)) continue
+      // A parameter without a declared default is left out so Jenkins applies its own.
+      if (!definition.hasDefault) continue
+      const value = definition.defaultValue
+      payload[definition.name] = typeof value === 'boolean' ? (value ? 'true' : 'false') : String(value)
+    }
+    return payload
+  }
+
   async function triggerBuild(jobUrl, params) {
-    const payload = params && typeof params === 'object' ? params : {}
+    const explicit = params && typeof params === 'object' ? params : {}
+    let payload = explicit
+    let usedDefaults = false
+    if (Object.keys(payload).length === 0) {
+      const definitions = await readParameterDefinitions(jobUrl)
+      if (definitions.length > 0) {
+        payload = defaultsFromDefinitions(definitions)
+        usedDefaults = true
+      }
+    }
     const keys = Object.keys(payload)
     const crumb = keys.length > 0 ? await readCrumb() : null
     const target = `${ensureTrailingSlash(jobUrl)}${keys.length > 0 ? 'buildWithParameters' : 'build'}`
@@ -422,7 +475,8 @@ function createJenkins(settings) {
       throw new Error('触发构建失败：认证未通过或当前账号没有构建权限')
     }
     if (response.status >= 400) {
-      throw new Error(`触发构建失败：HTTP ${response.status}${snippet(response.text) ? `，${snippet(response.text)}` : ''}`)
+      const hint = keys.length === 0 ? '（该任务可能需要参数，但没有读到可用默认值）' : ''
+      throw new Error(`触发构建失败：HTTP ${response.status}${hint}${snippet(response.text) ? `，${snippet(response.text)}` : ''}`)
     }
     let queueUrl = ''
     if (response.location) {
@@ -432,7 +486,13 @@ function createJenkins(settings) {
         queueUrl = ''
       }
     }
-    return { queued: true, queueUrl }
+    return {
+      queued: true,
+      queueUrl,
+      withParameters: keys.length > 0,
+      usedDefaults,
+      parameters: keys.length > 0 ? payload : undefined,
+    }
   }
 
   async function testConnection() {
@@ -737,14 +797,16 @@ export function apply(ctx, config) {
       },
       {
         name: 'jenkins_build',
-        description: 'Trigger a build of one Jenkins job. Returns the queue URL Jenkins created so the build can be followed with jenkins_builds.',
+        description:
+          'Trigger a build of one Jenkins job and return the queue URL. For a parameterized job, omitting params builds with each parameter’s declared default value; pass params only when a non-default value is really required.',
         parameters: {
           type: 'object',
           properties: {
             job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
             params: {
               type: 'object',
-              description: 'Optional build parameters. When present the job is started with buildWithParameters.',
+              description:
+                'Optional parameter overrides. Omit it to build with the job’s declared defaults (read from parameterDefinitions).',
               additionalProperties: true,
             },
           },
