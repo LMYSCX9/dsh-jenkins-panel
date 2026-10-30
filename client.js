@@ -24,6 +24,10 @@ window.__ModuleLoader__.load({
         connected: '已连接',
         notConnected: '未连接',
         connectHint: '尚未配置 Jenkins 地址',
+        pickJob: 'Jenkins 任务',
+        pickJobEmpty: '没有任务',
+        pickJobHint: '去面板配置',
+        buildSubmitted: '已提交构建',
         connection: '连接设置',
         collapse: '收起',
         expand: '展开',
@@ -87,6 +91,10 @@ window.__ModuleLoader__.load({
         connected: 'Connected',
         notConnected: 'Not connected',
         connectHint: 'No Jenkins URL configured yet',
+        pickJob: 'Jenkins job',
+        pickJobEmpty: 'No jobs',
+        pickJobHint: 'Configure in the panel',
+        buildSubmitted: 'Build submitted',
         connection: 'Connection',
         collapse: 'Collapse',
         expand: 'Edit',
@@ -146,6 +154,7 @@ window.__ModuleLoader__.load({
     }
 
     let localeService = null
+    let layoutService = null
     let activeLocale = 'en'
 
     function syncLocale() {
@@ -397,6 +406,224 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ------------------------------------------------------- hero job picker */
+
+    const PICKER_CSS = `
+.djq-root { position: relative; display: inline-flex; align-items: center; gap: 4px; }
+.djq-chip { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px 0 7px;
+  border-radius: 999px; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-primary); font: inherit; font-size: 12px; cursor: pointer; max-width: 220px; }
+.djq-chip:hover { border-color: var(--dsw-alias-border-l2); }
+.djq-chip[data-open="true"] { border-color: var(--dsw-alias-brand-primary); }
+.djq-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--dsw-alias-state-idle-primary); flex: none; }
+.djq-dot[data-state="success"] { background: var(--dsw-alias-state-success-primary); }
+.djq-dot[data-state="failure"] { background: var(--dsw-alias-state-error-primary); }
+.djq-dot[data-state="unstable"] { background: var(--dsw-alias-state-warn-primary); }
+.djq-dot[data-state="running"] { background: var(--dsw-alias-brand-primary); }
+.djq-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djq-caret { color: var(--dsw-alias-label-secondary); font-size: 10px; flex: none; }
+.djq-build { height: 24px; min-width: 24px; padding: 0 6px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary); font-size: 11px; font-family: inherit; }
+.djq-build:disabled { opacity: .55; cursor: default; }
+.djq-note { font-size: 11px; color: var(--dsw-alias-label-secondary); max-width: 190px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djq-pop { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 40; width: 320px; max-width: 74vw;
+  background: var(--dsw-alias-bg-overlay); border: 1px solid var(--dsw-alias-border-l1); border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18); padding: 8px; display: flex; flex-direction: column; gap: 6px;
+  box-sizing: border-box; }
+.djq-search { height: 28px; padding: 0 8px; font: inherit; font-size: 12px; border-radius: 8px;
+  border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-base);
+  color: var(--dsw-alias-label-primary); outline: none; }
+.djq-search:focus { border-color: var(--dsw-alias-brand-primary); }
+.djq-list { max-height: 240px; overflow: auto; display: flex; flex-direction: column; }
+.djq-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 8px;
+  cursor: pointer; font-size: 12px; text-align: left; background: transparent; border: 0;
+  color: inherit; font-family: inherit; width: 100%; box-sizing: border-box; }
+.djq-row:hover { background: var(--dsw-alias-bg-layer-2); }
+.djq-row[data-active="true"] { background: var(--dsw-alias-bg-layer-2); }
+.djq-rowmain { min-width: 0; display: flex; flex-direction: column; }
+.djq-rowname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.djq-rowmeta { font-size: 10px; color: var(--dsw-alias-label-secondary); }
+.djq-empty { padding: 12px 8px; font-size: 12px; color: var(--dsw-alias-label-secondary); text-align: center;
+  display: flex; flex-direction: column; gap: 8px; align-items: center; }
+.djq-link { background: transparent; border: 0; padding: 0; font: inherit; font-size: 12px;
+  color: var(--dsw-alias-brand-primary); cursor: pointer; text-decoration: underline; }
+`
+
+    function JenkinsJobPicker() {
+      useLocale()
+      const [open, setOpen] = useState(false)
+      const [jobs, setJobs] = useState(null)
+      const [error, setError] = useState('')
+      const [selected, setSelected] = useState(null)
+      const [busy, setBusy] = useState(false)
+      const [note, setNote] = useState('')
+      const [query, setQuery] = useState('')
+      const rootRef = useRef(null)
+
+      const load = useCallback(async () => {
+        setError('')
+        setJobs(null)
+        try {
+          const result = await callApi('/jobs', {})
+          if (!result.ok) {
+            setJobs([])
+            setError(result.error || t('pickJobEmpty'))
+            return
+          }
+          setJobs(Array.isArray(result.jobs) ? result.jobs : [])
+        } catch (caught) {
+          setJobs([])
+          setError(caught && caught.message ? caught.message : String(caught))
+        }
+      }, [])
+
+      const toggle = useCallback(() => {
+        setOpen((value) => {
+          const next = !value
+          if (next) void load()
+          return next
+        })
+      }, [load])
+
+      useEffect(() => {
+        if (!open) return undefined
+        const onDown = (event) => {
+          if (rootRef.current && !rootRef.current.contains(event.target)) setOpen(false)
+        }
+        document.addEventListener('mousedown', onDown)
+        return () => document.removeEventListener('mousedown', onDown)
+      }, [open])
+
+      const submit = useCallback(async (job) => {
+        setBusy(true)
+        setNote('')
+        try {
+          const result = await callApi('/build', { job: job.name, url: job.url })
+          if (!result.ok) throw new Error(result.error || '触发构建失败')
+          setNote(`${t('buildSubmitted')} · ${job.name}`)
+        } catch (caught) {
+          setNote(caught && caught.message ? caught.message : String(caught))
+        } finally {
+          setBusy(false)
+        }
+      }, [])
+
+      const filtered = useMemo(() => {
+        const list = jobs || []
+        const needle = query.trim().toLowerCase()
+        if (!needle) return list
+        return list.filter((job) => job.name.toLowerCase().includes(needle))
+      }, [jobs, query])
+
+      const openPanel = () => {
+        setOpen(false)
+        if (layoutService && typeof layoutService.selectPanel === 'function') {
+          try {
+            layoutService.selectPanel('jenkins')
+          } catch {
+            /* the panel may be unavailable in this composition */
+          }
+        }
+      }
+
+      let body
+      if (jobs === null) {
+        body = h('div', { className: 'djq-empty' }, t('loading'))
+      } else if (error) {
+        body = h(
+          'div',
+          { className: 'djq-empty' },
+          h('span', null, error),
+          h('button', { className: 'djq-link', type: 'button', onClick: openPanel }, t('pickJobHint')),
+        )
+      } else if (filtered.length === 0) {
+        body = h('div', { className: 'djq-empty' }, query ? t('noMatch') : t('pickJobEmpty'))
+      } else {
+        body = h(
+          'div',
+          { className: 'djq-list' },
+          filtered.map((job) =>
+            h(
+              'button',
+              {
+                key: job.name,
+                type: 'button',
+                className: 'djq-row',
+                'data-active': selected && selected.name === job.name ? 'true' : 'false',
+                onClick: () => {
+                  setSelected(job)
+                  setOpen(false)
+                  setNote('')
+                },
+              },
+              h('span', { className: 'djq-dot', 'data-state': stateOf(job.color) }),
+              h(
+                'div',
+                { className: 'djq-rowmain' },
+                h('span', { className: 'djq-rowname' }, job.name),
+                h(
+                  'span',
+                  { className: 'djq-rowmeta' },
+                  job.lastBuild
+                    ? `#${job.lastBuild.number === null ? '?' : job.lastBuild.number} · ${resultLabel(job.lastBuild.result, job.lastBuild.building)} · ${formatRelative(job.lastBuild.timestamp)}`
+                    : t('noBuild'),
+                ),
+              ),
+            ),
+          ),
+        )
+      }
+
+      return h(
+        'div',
+        { className: 'djq-root', ref: rootRef },
+        h('style', null, PICKER_CSS),
+        h(
+          'button',
+          {
+            className: 'djq-chip',
+            type: 'button',
+            'data-open': open ? 'true' : 'false',
+            title: selected ? selected.name : t('pickJob'),
+            onClick: toggle,
+          },
+          h('span', { className: 'djq-dot', 'data-state': selected ? stateOf(selected.color) : 'idle' }),
+          h('span', { className: 'djq-name' }, selected ? selected.name : t('pickJob')),
+          h('span', { className: 'djq-caret' }, '\u25BE'),
+        ),
+        selected
+          ? h(
+              'button',
+              {
+                className: 'djq-build',
+                type: 'button',
+                title: t('build'),
+                disabled: busy,
+                onClick: () => void submit(selected),
+              },
+              busy ? '…' : '\u25B6',
+            )
+          : null,
+        note ? h('span', { className: 'djq-note', title: note }, note) : null,
+        open
+          ? h(
+              'div',
+              { className: 'djq-pop' },
+              h('input', {
+                className: 'djq-search',
+                value: query,
+                placeholder: t('search'),
+                spellCheck: false,
+                onChange: (event) => setQuery(event.target.value),
+              }),
+              body,
+            )
+          : null,
+      )
+    }
+
     /* ----------------------------------------------------------------- panel */
 
     function JenkinsPanel() {
@@ -421,7 +648,7 @@ window.__ModuleLoader__.load({
         setForm((current) => ({
           baseUrl: next.baseUrl || '',
           username: next.username || '',
-          token: '',
+          token: current.token,
           insecureTls: next.insecureTls !== false,
           jobFilter: next.jobFilter || '',
         }))
@@ -590,9 +817,12 @@ window.__ModuleLoader__.load({
         return jobs.filter((job) => job.name.toLowerCase().includes(needle))
       }, [jobs, search])
 
-      const chipText = settings.configured
-        ? `${t('connected')} · ${settings.baseUrl.replace(/^https?:\/\//, '')}`
-        : t('connectHint')
+      const chipFailed = settings.configured && !!banner && banner.kind === 'error'
+      const chipText = !settings.configured
+        ? t('connectHint')
+        : chipFailed
+          ? t('notConnected')
+          : `${t('connected')} · ${settings.baseUrl.replace(/^https?:\/\//, '')}`
 
       const field = (label, key, options) => {
         const opts = options || {}
@@ -633,7 +863,7 @@ window.__ModuleLoader__.load({
               { className: 'djl-head-right' },
               h(
                 'span',
-                { className: 'djl-chip', 'data-on': settings.configured ? 'true' : 'false' },
+                { className: 'djl-chip', 'data-on': settings.configured && !chipFailed ? 'true' : 'false' },
                 h('span', { className: 'djl-chip-dot' }),
                 chipText,
               ),
@@ -839,6 +1069,7 @@ window.__ModuleLoader__.load({
       inject: ['slots', 'locale'],
       apply(ctx) {
         localeService = ctx.locale
+        layoutService = typeof ctx.get === 'function' ? ctx.get('layout') : null
         syncLocale()
 
         ctx.slots.inject('sidebar.panellist', () =>
@@ -855,6 +1086,13 @@ window.__ModuleLoader__.load({
 
         ctx.slots.inject('main', () =>
           ctx.slots.register({ name: 'main', key: 'jenkins' }, JenkinsPanel),
+        )
+
+        ctx.slots.inject('conversation.hero.options', () =>
+          ctx.slots.register(
+            { name: 'conversation.hero.options', id: 'jenkins-job', order: 10, label: () => t('pickJob') },
+            JenkinsJobPicker,
+          ),
         )
       },
     }

@@ -246,10 +246,24 @@ function parseJson(response, action) {
   }
 }
 
+function describeChallenge(response) {
+  const parts = []
+  const www = response.headers ? response.headers['www-authenticate'] : undefined
+  if (typeof www === 'string' && www) parts.push(`WWW-Authenticate: ${www}`)
+  const server = response.headers ? response.headers.server : undefined
+  if (typeof server === 'string' && server) parts.push(`Server: ${server}`)
+  if (response.sentAuthorization === false) parts.push('未发送认证头（用户名与 Token 都是空的）')
+  if (response.url) parts.push(`URL: ${response.url}`)
+  const body = snippet(response.text, 160)
+  if (body) parts.push(`响应: ${body}`)
+  return parts.join('｜')
+}
+
 function ensureOk(response, action) {
   const status = response.status
   if (status === 401 || status === 403) {
-    throw new Error(`${action}失败：认证未通过（HTTP ${status}），请检查用户名与 API Token`)
+    const detail = describeChallenge(response)
+    throw new Error(`${action}失败：HTTP ${status}${detail ? `｜${detail}` : ''}｜请检查用户名与 API Token`)
   }
   if (status === 404) {
     throw new Error(`${action}失败：接口不存在（HTTP 404），请确认填写的 Jenkins 根地址是否正确`)
@@ -279,13 +293,16 @@ function createJenkins(settings) {
     if (authHeader) headers.authorization = authHeader
     if (opts.crumb) headers[opts.crumb.field] = opts.crumb.value
     if (opts.body !== undefined) headers['content-type'] = 'application/x-www-form-urlencoded'
-    return httpCall(absolute, {
+    const response = await httpCall(absolute, {
       method: opts.method || 'GET',
       headers,
       body: opts.body,
       insecureTls: settings.insecureTls,
       timeoutMs: opts.timeoutMs || DEFAULT_TIMEOUT_MS,
     })
+    response.url = absolute
+    response.sentAuthorization = Boolean(authHeader)
+    return response
   }
 
   async function readCrumb() {
@@ -422,18 +439,30 @@ function createJenkins(settings) {
     const started = Date.now()
     const response = await call('api/json?tree=mode,nodeDescription,useSecurity')
     if (response.status === 401 || response.status === 403) {
-      throw new Error(`认证未通过（HTTP ${response.status}），请检查用户名与 API Token`)
+      const detail = describeChallenge(response)
+      throw new Error(`认证未通过（HTTP ${response.status}）${detail ? `｜${detail}` : ''}｜请检查用户名与 API Token`)
     }
     if (response.status === 404) {
       throw new Error('地址可以访问，但 /api/json 不存在，可能不是 Jenkins 根地址')
     }
     ensureOk(response, '连接测试')
     const data = parseJson(response, '连接测试')
+    let authenticatedAs = ''
+    try {
+      const who = await call('whoAmI/api/json')
+      if (who.status === 200) {
+        const info = parseJson(who, '读取当前用户')
+        if (info && typeof info.name === 'string') authenticatedAs = info.name
+      }
+    } catch {
+      /* optional: older Jenkins or a restricted realm may not answer whoAmI */
+    }
     return {
       ok: true,
       latencyMs: Date.now() - started,
       version: typeof response.headers['x-jenkins'] === 'string' ? response.headers['x-jenkins'] : '',
       mode: typeof data.mode === 'string' ? data.mode : '',
+      authenticatedAs,
     }
   }
 

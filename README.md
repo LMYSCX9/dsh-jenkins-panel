@@ -13,6 +13,7 @@ DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来�
 - **触发构建**：每行「构建」按钮，自动获取 CSRF crumb，返回 Jenkins 队列地址；提交后 4 秒自动刷新。
 - **构建历史**：每行「历史」展开最近 8 次构建。
 - **构建队列**：排队项与等待原因。
+- **会话页快捷选择器**：在 Hero 界面「工作区 / 模式」那一行的右侧有一个「Jenkins 任务」胶囊，点开即任务列表（带搜索），选中后需再按 ▶ 才触发构建，避免误点。
 
 Agent 工具（与面板共用同一套 Host 代码）：
 
@@ -32,7 +33,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ```text
 # npm
-dsh-jenkins-panel@1.0.0
+dsh-jenkins-panel@1.1.0
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
