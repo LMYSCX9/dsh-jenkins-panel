@@ -1,4 +1,4 @@
-﻿# dsh-jenkins
+# dsh-jenkins
 
 DSH锛圖eepSeek Harness锛夌殑 Jenkins 鎻掍欢锛氬乏渚ф爮鍏ュ彛 + 闈㈡澘锛岀敤鏉ヨ繛鎺?Jenkins銆佹煡璇换鍔°€佽Е鍙戞瀯寤恒€佹煡鐪嬮槦鍒楋紱鍚屾牱鐨勮兘鍔涘悓鏃朵互 6 涓?Agent 宸ュ叿鏆撮湶缁欐ā鍨嬨€傛敮鎸佸悓鏃堕厤缃涓?Jenkins 鏈嶅姟鍣ㄣ€?
 闆惰繍琛屾椂渚濊禆锛堝彧鐢?Node 鍐呯疆妯″潡锛夛紝绾?ESM锛屾棤鏋勫缓姝ラ銆?
