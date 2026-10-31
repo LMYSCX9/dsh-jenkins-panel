@@ -665,9 +665,72 @@ function isLocalSpec(target) {
   )
 }
 
+/** Extract a fetchable git remote from a spec or a bundle `source` string. */
+function gitRemoteOf(value) {
+  const text = String(value === undefined || value === null ? '' : value).trim()
+  if (!text) return ''
+  const withoutPrefix = text.replace(/^git\+/, '')
+  const hashIndex = withoutPrefix.indexOf('#')
+  const base = hashIndex >= 0 ? withoutPrefix.slice(0, hashIndex) : withoutPrefix
+  const looksRemote =
+    /^https?:\/\//i.test(base) ||
+    /^(ssh|git):\/\//i.test(base) ||
+    /^[\w.-]+@[\w.-]+:/.test(base)
+  if (!looksRemote) return ''
+  const looksRepo =
+    /\.git$/i.test(base) ||
+    /\.git\//i.test(base) ||
+    /^https?:\/\/(github|gitlab|bitbucket|gitee|gitea)\.com?\/[^/]+\/[^/?#]+\/?$/i.test(base)
+  if (!looksRepo) return ''
+  return base.replace(/\/+$/, '')
+}
+
 /**
- * Resolve whether a newer release exists for this plugin's own install target.
- * Only registry installs can be updated in place; local and git installs say why not.
+ * A git install has no registry version, so update means "the tip of the default branch".
+ * The usual default branch names are tried in order; the first that resolves wins.
+ */
+async function checkGitUpdate(manager, remote, base) {
+  if (typeof manager.inspect !== 'function') {
+    return { ...base, supported: false, source: remote, reason: '插件管理器不支持版本查询' }
+  }
+  let lastReason = ''
+  for (const ref of ['main', 'master']) {
+    const spec = `git+${remote}#${ref}`
+    let inspection
+    try {
+      inspection = await manager.inspect(spec)
+    } catch (error) {
+      lastReason = errorMessage(error)
+      continue
+    }
+    if (!inspection || inspection.status !== 'accepted') {
+      lastReason = (inspection && inspection.reason) || lastReason
+      continue
+    }
+    const latestVersion = typeof inspection.version === 'string' ? inspection.version : ''
+    return {
+      ...base,
+      supported: true,
+      kind: 'git',
+      target: spec,
+      source: remote,
+      ref,
+      latestVersion,
+      updateAvailable: latestVersion ? compareVersions(latestVersion, SELF.version) > 0 : false,
+    }
+  }
+  return {
+    ...base,
+    supported: false,
+    source: remote,
+    reason: `git 安装：无法解析远端分支${lastReason ? `（${lastReason}）` : ''}`,
+  }
+}
+
+/**
+ * Resolve whether a newer release exists for this plugin's own install target:
+ * a registry version for npm installs, the default-branch tip for git installs,
+ * and an explanation for local-directory installs.
  */
 async function checkForUpdate(manager) {
   const base = { name: SELF.name, currentVersion: SELF.version }
@@ -685,19 +748,17 @@ async function checkForUpdate(manager) {
 
   const target = entry.installTarget && typeof entry.installTarget.spec === 'string' ? entry.installTarget.spec : ''
   const source = typeof entry.source === 'string' ? entry.source : ''
-  if (!target) {
-    const sourcePath = source.replace(/^(link|file|path):/i, '')
-    if (/^(link|file|path):/i.test(source) || isLocalSpec(sourcePath)) {
-      return { ...base, supported: false, source, reason: '当前是本地目录安装：改源码后重新安装即可，不通过市场更新' }
-    }
-    return { ...base, supported: false, source, reason: '没有可用的安装来源，无法自更新' }
-  }
-  if (isLocalSpec(target)) {
+
+  const localSource = /^(link|file|path):/i.test(source) || isLocalSpec(source.replace(/^(link|file|path):/i, ''))
+  if (isLocalSpec(target) || (!target && localSource)) {
     return { ...base, supported: false, target, source, reason: '当前是本地目录安装：改源码后重新安装即可，不通过市场更新' }
   }
-  if (/^git\+/i.test(target) || /^https?:\/\/.*\.git/i.test(target)) {
-    return { ...base, supported: false, target, source, reason: '当前是 git 安装：更新需要指定新的 ref，或改用 npm 发布后自动更新' }
-  }
+
+  // A git install may not report an installTarget at all; its `source` carries the remote.
+  const gitRemote = gitRemoteOf(target) || gitRemoteOf(source)
+  if (gitRemote) return checkGitUpdate(manager, gitRemote, base)
+
+  if (!target) return { ...base, supported: false, source, reason: `没有可用的安装来源，无法自更新（来源：${source || '未知'}）` }
   if (typeof manager.inspect !== 'function') {
     return { ...base, supported: false, target, source, reason: '插件管理器不支持版本查询' }
   }
