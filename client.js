@@ -68,6 +68,7 @@ window.__ModuleLoader__.load({
         build: '构建',
         building: '构建中…',
         history: '历史',
+        buildHistory: '构建历史',
         hideHistory: '收起',
         noBuilds: '没有构建记录',
         noBuild: '暂无构建',
@@ -147,6 +148,7 @@ window.__ModuleLoader__.load({
         build: 'Build',
         building: 'Starting…',
         history: 'History',
+        buildHistory: 'Build history',
         hideHistory: 'Hide',
         noBuilds: 'No build records',
         noBuild: 'No build yet',
@@ -393,6 +395,9 @@ window.__ModuleLoader__.load({
 .djl-job-actions { display: flex; align-items: center; gap: 6px; }
 .djl-job-actions .djl-btn { height: 26px; padding: 0 10px; font-size: 12px; }
 .djl-builds { grid-column: 1 / -1; padding: 4px 0 6px 20px; }
+.djl-builds-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.djl-builds-title { font-size: 11px; font-weight: 600; color: var(--dsw-alias-label-secondary); }
+.djl-builds-head .djl-btn { height: 22px; padding: 0 8px; font-size: 11px; }
 .djl-build-row { display: flex; align-items: center; gap: 10px; font-size: 11px;
   color: var(--dsw-alias-label-secondary); padding: 3px 0; }
 .djl-build-num { color: var(--dsw-alias-label-primary); font-variant-numeric: tabular-nums; min-width: 44px; }
@@ -454,6 +459,7 @@ window.__ModuleLoader__.load({
       const [queue, setQueue] = useState([])
       const [search, setSearch] = useState('')
       const [expanded, setExpanded] = useState('')
+      const [jobsOpen, setJobsOpen] = useState(true)
       const [builds, setBuilds] = useState({})
       const [busyJob, setBusyJob] = useState('')
       const [updateInfo, setUpdateInfo] = useState(null)
@@ -796,6 +802,90 @@ window.__ModuleLoader__.load({
         return jobs.filter((job) => job.name.toLowerCase().includes(needle))
       }, [jobs, search])
 
+      let jobsBody = null
+      if (jobsOpen) {
+        if (loading) jobsBody = h('div', { className: 'djl-empty' }, t('loading'))
+        else if (!settings.configured) jobsBody = h('div', { className: 'djl-empty' }, t('emptyHint'))
+        else if (filtered.length === 0) jobsBody = h('div', { className: 'djl-empty' }, search ? t('noMatch') : t('empty'))
+        else
+          jobsBody = h(
+            'ul',
+            { className: 'djl-list' },
+            filtered.map((job) => {
+              const last = job.lastBuild
+              const open = expanded === job.name
+              const rows = builds[job.name]
+              return h(
+                'li',
+                { className: 'djl-job', key: job.name },
+                h('span', { className: 'djl-dot', 'data-state': stateOf(job.color) }),
+                h(
+                  'div',
+                  { className: 'djl-job-main' },
+                  h('div', { className: 'djl-job-name', title: job.name }, job.name),
+                  h(
+                    'div',
+                    { className: 'djl-job-meta' },
+                    last
+                      ? `#${last.number === null ? '?' : last.number} · ${resultLabel(last.result, last.building)} · ${formatRelative(last.timestamp)}${last.duration ? ` · ${formatDuration(last.duration)}` : ''}`
+                      : t('noBuild'),
+                  ),
+                ),
+                h(
+                  'div',
+                  { className: 'djl-job-actions' },
+                  h(
+                    'button',
+                    { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => void toggleHistory(job) },
+                    open ? t('hideHistory') : t('history'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      className: 'djl-btn',
+                      type: 'button',
+                      disabled: busyJob !== '',
+                      onClick: () => void trigger(job),
+                    },
+                    busyJob === job.name ? t('building') : t('build'),
+                  ),
+                ),
+                open
+                  ? h(
+                      'div',
+                      { className: 'djl-builds' },
+                      h(
+                        'div',
+                        { className: 'djl-builds-head' },
+                        h('span', { className: 'djl-builds-title' }, t('buildHistory')),
+                        h(
+                          'button',
+                          { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => setExpanded('') },
+                          t('hideHistory'),
+                        ),
+                      ),
+                      rows === undefined
+                        ? h('div', { className: 'djl-build-row' }, t('loading'))
+                        : rows.length === 0
+                          ? h('div', { className: 'djl-build-row' }, t('noBuilds'))
+                          : rows.map((build) =>
+                              h(
+                                'div',
+                                { className: 'djl-build-row', key: String(build.number) },
+                                h('span', { className: 'djl-build-num' }, `#${build.number === null ? '?' : build.number}`),
+                                h('span', { className: 'djl-dot', 'data-state': build.building ? 'running' : stateOf({ SUCCESS: 'blue', FAILURE: 'red', UNSTABLE: 'yellow', ABORTED: 'aborted' }[build.result] || 'grey') }),
+                                h('span', null, resultLabel(build.result, build.building)),
+                                h('span', null, formatRelative(build.timestamp)),
+                                h('span', null, formatDuration(build.duration)),
+                              ),
+                            ),
+                    )
+                  : null,
+              )
+            }),
+          )
+      }
+
       const chipFailed = settings.configured && !!banner && banner.kind === 'error'
       const chipText = !settings.configured
         ? t('connectHint')
@@ -1007,79 +1097,13 @@ window.__ModuleLoader__.load({
                 spellCheck: false,
                 onChange: (event) => setSearch(event.target.value),
               }),
+              h(
+                'button',
+                { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => setJobsOpen((value) => !value) },
+                jobsOpen ? t('collapse') : t('expand'),
+              ),
             ),
-            loading
-              ? h('div', { className: 'djl-empty' }, t('loading'))
-              : !settings.configured
-                ? h('div', { className: 'djl-empty' }, t('emptyHint'))
-                : filtered.length === 0
-                  ? h('div', { className: 'djl-empty' }, search ? t('noMatch') : t('empty'))
-                  : h(
-                      'ul',
-                      { className: 'djl-list' },
-                      filtered.map((job) => {
-                        const last = job.lastBuild
-                        const open = expanded === job.name
-                        const rows = builds[job.name]
-                        return h(
-                          'li',
-                          { className: 'djl-job', key: job.name },
-                          h('span', { className: 'djl-dot', 'data-state': stateOf(job.color) }),
-                          h(
-                            'div',
-                            { className: 'djl-job-main' },
-                            h('div', { className: 'djl-job-name', title: job.name }, job.name),
-                            h(
-                              'div',
-                              { className: 'djl-job-meta' },
-                              last
-                                ? `#${last.number === null ? '?' : last.number} · ${resultLabel(last.result, last.building)} · ${formatRelative(last.timestamp)}${last.duration ? ` · ${formatDuration(last.duration)}` : ''}`
-                                : t('noBuild'),
-                            ),
-                          ),
-                          h(
-                            'div',
-                            { className: 'djl-job-actions' },
-                            h(
-                              'button',
-                              { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => void toggleHistory(job) },
-                              open ? t('hideHistory') : t('history'),
-                            ),
-                            h(
-                              'button',
-                              {
-                                className: 'djl-btn',
-                                type: 'button',
-                                disabled: busyJob !== '',
-                                onClick: () => void trigger(job),
-                              },
-                              busyJob === job.name ? t('building') : t('build'),
-                            ),
-                          ),
-                          open
-                            ? h(
-                                'div',
-                                { className: 'djl-builds' },
-                                rows === undefined
-                                  ? h('div', { className: 'djl-build-row' }, t('loading'))
-                                  : rows.length === 0
-                                    ? h('div', { className: 'djl-build-row' }, t('noBuilds'))
-                                    : rows.map((build) =>
-                                        h(
-                                          'div',
-                                          { className: 'djl-build-row', key: String(build.number) },
-                                          h('span', { className: 'djl-build-num' }, `#${build.number === null ? '?' : build.number}`),
-                                          h('span', { className: 'djl-dot', 'data-state': build.building ? 'running' : stateOf({ SUCCESS: 'blue', FAILURE: 'red', UNSTABLE: 'yellow', ABORTED: 'aborted' }[build.result] || 'grey') }),
-                                          h('span', null, resultLabel(build.result, build.building)),
-                                          h('span', null, formatRelative(build.timestamp)),
-                                          h('span', null, formatDuration(build.duration)),
-                                        ),
-                                      ),
-                              )
-                            : null,
-                        )
-                      }),
-                    ),
+            jobsBody,
           ),
 
           h(
