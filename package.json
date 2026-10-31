@@ -1,6 +1,6 @@
 {
   "name": "dsh-jenkins-panel",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "type": "module",
   "description": "Jenkins panel in the DSH sidebar: connect one or more Jenkins servers, browse jobs, inspect the build queue, and trigger builds.",
   "license": "MIT",
