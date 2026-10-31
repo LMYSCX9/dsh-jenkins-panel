@@ -720,53 +720,65 @@ function looksLikeGitSource(value) {
 
 /**
  * A git install has no registry version, so update means "the tip of the default branch".
- * The usual default branch names are tried in order; the first that resolves wins.
+ * DSH's manager.inspect validates git specs but never returns a version for them,
+ * so the tip's version is read straight from the repo's package.json instead:
+ * jsDelivr first (reachable from CN networks), then raw.githubusercontent.com.
  */
-async function checkGitUpdate(manager, remote, base) {
-  if (typeof manager.inspect !== 'function') {
-    return { ...base, supported: false, source: remote, reason: '插件管理器不支持版本查询' }
+async function checkGitUpdate(remote, base) {
+  const github = /^https?:\/\/(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(remote)
+  if (!github) {
+    return { ...base, supported: false, source: remote, reason: 'git 安装：仅支持 github.com 远端的自动更新' }
   }
-  let lastReason = ''
-  const needsPrefix = /^https?:\/\//i.test(remote) || /^(ssh|git):\/\//i.test(remote)
+  const owner = github[1]
+  const repo = github[2].replace(/\.git$/i, '')
+  const problems = []
   for (const ref of ['main', 'master']) {
-    const spec = `${needsPrefix ? 'git+' : ''}${remote}#${ref}`
-    let inspection
-    try {
-      inspection = await manager.inspect(spec)
-    } catch (error) {
-      lastReason = errorMessage(error)
-      continue
-    }
-    if (!inspection || inspection.status !== 'accepted') {
-      lastReason = (inspection && inspection.reason) || lastReason
-      continue
-    }
-    const latestVersion = typeof inspection.version === 'string' ? inspection.version : ''
-    if (!latestVersion) {
+    const urls = [
+      `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
+      `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/package.json`,
+    ]
+    for (const url of urls) {
+      let text = ''
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(15000) })
+        if (!response.ok) {
+          problems.push(`${new URL(url).host} → HTTP ${response.status}`)
+          continue
+        }
+        text = await response.text()
+      } catch (error) {
+        problems.push(`${new URL(url).host} → ${errorMessage(error)}`)
+        continue
+      }
+      let manifest
+      try {
+        manifest = JSON.parse(text)
+      } catch {
+        problems.push(`${new URL(url).host} → 响应不是 JSON`)
+        continue
+      }
+      const latestVersion = typeof manifest.version === 'string' ? manifest.version : ''
+      if (!latestVersion) {
+        problems.push(`${new URL(url).host} → package.json 没有 version`)
+        continue
+      }
       return {
         ...base,
-        supported: false,
+        supported: true,
         kind: 'git',
+        target: `git+${remote}#${ref}`,
         source: remote,
-        reason: `git 安装：已解析 ${ref} 分支，但插件管理器未返回版本号，无法比较（可能是 DSH 版本过旧，inspect 不解析 git 包的 version，请升级 DSH 后重试）`,
+        ref,
+        latestVersion,
+        updateAvailable: compareVersions(latestVersion, SELF.version) > 0,
       }
-    }
-    return {
-      ...base,
-      supported: true,
-      kind: 'git',
-      target: spec,
-      source: remote,
-      ref,
-      latestVersion,
-      updateAvailable: compareVersions(latestVersion, SELF.version) > 0,
     }
   }
   return {
     ...base,
     supported: false,
     source: remote,
-    reason: `git 安装：无法解析远端分支${lastReason ? `（${lastReason}）` : ''}`,
+    reason: `git 安装：无法读取远端版本${problems.length ? `（${problems.slice(0, 2).join('；')}）` : ''}`,
   }
 }
 
@@ -799,9 +811,9 @@ async function checkForUpdate(manager) {
 
   // A git install may not report an installTarget at all; its `source` carries the remote.
   const gitRemote = gitRemoteOf(target) || gitRemoteOf(source)
-  if (gitRemote) return checkGitUpdate(manager, gitRemote, base)
+  if (gitRemote) return checkGitUpdate(gitRemote, base)
   // Unrecognised git shorthand: hand the manager's own source string back to it.
-  if (looksLikeGitSource(source)) return checkGitUpdate(manager, gitSpecBase(source), base)
+  if (looksLikeGitSource(source)) return checkGitUpdate(gitSpecBase(source), base)
 
   if (!target) return { ...base, supported: false, source, reason: `没有可用的安装来源，无法自更新（来源：${source || '未知'}）` }
   if (typeof manager.inspect !== 'function') {
