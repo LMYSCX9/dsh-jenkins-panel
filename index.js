@@ -1316,19 +1316,44 @@ async function checkForUpdate(manager) {
   })
 }
 
-async function applyUpdate(manager, approvedBuilds, known) {
+// What this process last reported via /update. The client echoes it back to
+// /update/apply; the fast path below only trusts that echo when it matches
+// this server-side record exactly, so a forged request body can never pick
+// its own install target (a local path, another repo, another package).
+let lastUpdateCheck = null
+
+function rememberUpdateCheck(info) {
+  if (
+    info &&
+    info.supported &&
+    info.updateAvailable &&
+    typeof info.target === 'string' &&
+    info.target &&
+    typeof info.latestVersion === 'string' &&
+    info.latestVersion
+  ) {
+    lastUpdateCheck = { target: info.target, latestVersion: info.latestVersion }
+  }
+}
+
+async function applyUpdate(manager, known) {
   if (!manager || typeof manager.installBundle !== 'function') throw new Error('当前环境没有插件管理器，无法更新')
   const knownVersion = known && typeof known.latestVersion === 'string' ? known.latestVersion : ''
+  const knownTarget = known && typeof known.target === 'string' ? known.target : ''
   let info
-  if (known && typeof known.target === 'string' && known.target && knownVersion && compareVersions(knownVersion, SELF.version) > 0) {
-    // The client just checked and saw this version. Trust it instead of
-    // re-querying the flaky mirrors, which can fail or serve a stale answer.
-    if (compareVersions(knownVersion, highestSeenRemoteVersion) > 0) highestSeenRemoteVersion = knownVersion
+  if (
+    lastUpdateCheck &&
+    knownVersion === lastUpdateCheck.latestVersion &&
+    knownTarget === lastUpdateCheck.target &&
+    !isLocalSpec(knownTarget)
+  ) {
+    // The client echoes the exact target and version this process checked
+    // before. Trust that instead of re-querying the flaky mirrors.
     info = {
       name: SELF.name,
       currentVersion: SELF.version,
       supported: true,
-      target: known.target,
+      target: knownTarget,
       latestVersion: knownVersion,
       updateAvailable: true,
     }
@@ -1340,7 +1365,6 @@ async function applyUpdate(manager, approvedBuilds, known) {
   const result = await manager.installBundle(info.target, {
     enabled: true,
     saveExact: true,
-    ...(Array.isArray(approvedBuilds) && approvedBuilds.length > 0 ? { approvedBuilds } : {}),
   })
   // The manager resolves failed installs instead of rejecting them
   // (application: 'failed' | 'cancelled', error: { code, diagnostic }).
@@ -1358,6 +1382,42 @@ function isLoopback(req) {
   const address = req.socket && req.socket.remoteAddress
   if (!address) return true
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1' || address.startsWith('::ffff:127.')
+}
+
+/** Host header must name this machine: a DNS-rebinding domain fails here even though it resolves to loopback. */
+function hostHeaderIsLoopback(value) {
+  const header = String(value || '').trim().toLowerCase()
+  if (!header) return false
+  let name = header
+  if (name.startsWith('[')) {
+    const end = name.indexOf(']')
+    if (end === -1) return false
+    name = name.slice(1, end)
+  } else {
+    const colon = name.indexOf(':')
+    if (colon !== -1) name = name.slice(0, colon)
+  }
+  return (
+    name === 'localhost' ||
+    name.endsWith('.localhost') ||
+    name === '::1' ||
+    name === '::ffff:127.0.0.1' ||
+    name.startsWith('127.') ||
+    name.startsWith('::ffff:127.')
+  )
+}
+
+/** A browser-supplied Origin (if any) must address the same host as the Host header; blocks cross-site POSTs. */
+function originMatchesHost(origin, hostHeader) {
+  const host = String(hostHeader || '').trim().toLowerCase()
+  if (!host) return false
+  try {
+    const url = new URL(String(origin))
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    return url.host.toLowerCase() === host
+  } catch {
+    return false
+  }
 }
 
 function sendJson(res, status, payload) {
@@ -1402,8 +1462,13 @@ function readJsonBody(req) {
 
 function createRouteHandler(store) {
   return async function handle(req, res) {
-    if (!isLoopback(req)) {
+    if (!isLoopback(req) || !hostHeaderIsLoopback(req.headers.host)) {
       sendJson(res, 403, { ok: false, error: '只接受本机请求' })
+      return
+    }
+    const origin = typeof req.headers.origin === 'string' ? req.headers.origin : ''
+    if (origin && !originMatchesHost(origin, req.headers.host)) {
+      sendJson(res, 403, { ok: false, error: '拒绝跨站请求' })
       return
     }
     let route = '/'
@@ -1427,20 +1492,20 @@ function createRouteHandler(store) {
 
       if (route === '/update') {
         const info = await checkForUpdate(store.manager ? store.manager() : null)
+        rememberUpdateCheck(info)
         sendJson(res, 200, { ok: true, ...info })
         return
       }
 
       if (route === '/update/apply' && req.method === 'POST') {
-        const approved = Array.isArray(body.approvedBuilds)
-          ? body.approvedBuilds.filter((entry) => typeof entry === 'string')
-          : []
-        // The version the client just saw: preferred over a fresh mirror query.
+        // The version the client just saw: accepted only when it matches what
+        // this process itself checked (lastUpdateCheck); otherwise a fresh
+        // check runs and decides. Never trust a target from the request body.
         const known = {
           latestVersion: typeof body.latestVersion === 'string' ? body.latestVersion : '',
           target: typeof body.target === 'string' ? body.target : '',
         }
-        const result = await applyUpdate(store.manager ? store.manager() : null, approved, known)
+        const result = await applyUpdate(store.manager ? store.manager() : null, known)
         sendJson(res, 200, { ok: true, ...result })
         return
       }

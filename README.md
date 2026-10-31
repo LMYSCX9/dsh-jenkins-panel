@@ -83,7 +83,8 @@ git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
 ## 安全边界
 
 - Token **只写不读**：任何接口只返回 `hasToken: true/false`，不回显内容，也不进会话上下文。Token 存于 DSH 凭据服务（`~/.dsh/.credentials.yaml`，权限 `0600`），不进插件设置文件。
-- `/dsh-jenkins` 路由**只接受本机（loopback）请求**，非本机来源直接 403。
+- `/dsh-jenkins` 路由**只接受本机（loopback）请求**，非本机来源直接 403；同时要求 `Host` 头指向本机（防 DNS rebinding），浏览器携带的 `Origin` 必须与 `Host` 一致（防恶意网页跨站 POST）。
+- 自更新的安装目标（`/update/apply`）**只接受本进程 `/update` 检查结果的精确回传**，请求体伪造的 target 会被忽略并重新检查；`approvedBuilds` 不再接受外部传入。
 - 请求特性：`insecureTls` 打开时接受自签名证书，适用于内网 Jenkins；关闭时按 Node 默认策略校验证书。
 
 ## 兼容性
