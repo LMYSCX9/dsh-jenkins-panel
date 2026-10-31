@@ -35,6 +35,14 @@ window.__ModuleLoader__.load({
         addConn: '新增连接',
         removeConn: '删除',
         removeConfirm: '确定删除这个 Jenkins 连接？',
+        checkUpdate: '检查更新',
+        checkingUpdate: '检查中…',
+        updating: '更新中…',
+        applyUpdate: '更新到',
+        updateAvailable: '发现新版本',
+        upToDate: '已是最新版本',
+        updateDone: '更新完成',
+        updateRestart: '更新已安装，重启 DSH 后生效',
         collapse: '收起',
         expand: '展开',
         baseUrl: 'Jenkins 地址',
@@ -108,6 +116,14 @@ window.__ModuleLoader__.load({
         addConn: 'Add connection',
         removeConn: 'Remove',
         removeConfirm: 'Remove this Jenkins connection?',
+        checkUpdate: 'Check for updates',
+        checkingUpdate: 'Checking…',
+        updating: 'Updating…',
+        applyUpdate: 'Update to',
+        updateAvailable: 'New version',
+        upToDate: 'Up to date',
+        updateDone: 'Update installed',
+        updateRestart: 'Installed — restart DSH to finish',
         collapse: 'Collapse',
         expand: 'Edit',
         baseUrl: 'Jenkins URL',
@@ -324,6 +340,12 @@ window.__ModuleLoader__.load({
 .djl-card-head h2 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
 .djl-connbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .djl-select { width: auto; min-width: 160px; max-width: 240px; height: 30px; }
+.djl-update { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: -6px;
+  font-size: 12px; color: var(--dsw-alias-label-secondary); }
+.djl-update .djl-btn { height: 26px; padding: 0 10px; font-size: 11px; }
+.djl-version { font-variant-numeric: tabular-nums; }
+.djl-update-text { font-size: 11px; color: var(--dsw-alias-label-secondary);
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .djl-count { font-weight: 400; color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .djl-card-body { padding: 16px; }
 .djl-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
@@ -657,6 +679,7 @@ window.__ModuleLoader__.load({
       const [expanded, setExpanded] = useState('')
       const [builds, setBuilds] = useState({})
       const [busyJob, setBusyJob] = useState('')
+      const [updateInfo, setUpdateInfo] = useState(null)
       const timerRef = useRef(null)
 
       const settings = useMemo(
@@ -740,13 +763,17 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         void bootstrap()
+        const updateTimer = setTimeout(() => {
+          void checkUpdate(true)
+        }, 900)
         return () => {
+          clearTimeout(updateTimer)
           if (timerRef.current) {
             clearTimeout(timerRef.current)
             timerRef.current = null
           }
         }
-      }, [bootstrap])
+      }, [bootstrap, checkUpdate])
 
       // Load jobs and the queue whenever the selected connection becomes usable.
       useEffect(() => {
@@ -886,6 +913,38 @@ window.__ModuleLoader__.load({
         [applyState],
       )
 
+      const checkUpdate = useCallback(async (silent) => {
+        if (!silent) setBusy('update')
+        try {
+          const info = await callApi('/update')
+          if (info && info.ok) {
+            setUpdateInfo(info)
+          } else if (!silent) {
+            setBanner({ kind: 'error', text: (info && info.error) || '检查更新失败' })
+          }
+        } catch (error) {
+          if (!silent) setBanner({ kind: 'error', text: error.message })
+        } finally {
+          if (!silent) setBusy('')
+        }
+      }, [])
+
+      const runUpdate = useCallback(async () => {
+        setBusy('updating')
+        setBanner(null)
+        try {
+          const result = await callApi('/update/apply', {})
+          if (!result.ok) throw new Error(result.error || '更新失败')
+          setUpdateInfo(result)
+          const application = result.result ? result.result.application : ''
+          setBanner({ kind: 'ok', text: application === 'restart-required' ? t('updateRestart') : t('updateDone') })
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [])
+
       const refresh = useCallback(async () => {
         setBusy('refresh')
         setBanner(null)
@@ -945,6 +1004,14 @@ window.__ModuleLoader__.load({
           ? t('notConnected')
           : `${t('connected')} · ${settings.name ? `${settings.name} · ` : ''}${settings.baseUrl.replace(/^https?:\/\//, '')}`
 
+      const updateText = !updateInfo
+        ? ''
+        : updateInfo.supported
+          ? updateInfo.updateAvailable
+            ? `${t('updateAvailable')} ${updateInfo.latestVersion || ''}`
+            : t('upToDate')
+          : updateInfo.reason || ''
+
       const field = (label, key, options) => {
         const opts = options || {}
         return h(
@@ -994,6 +1061,25 @@ window.__ModuleLoader__.load({
                 busy === 'refresh' ? t('refreshing') : t('refresh'),
               ),
             ),
+          ),
+
+          h(
+            'div',
+            { className: 'djl-update' },
+            updateInfo && updateInfo.currentVersion ? h('span', { className: 'djl-version' }, `v${updateInfo.currentVersion}`) : null,
+            h(
+              'button',
+              { className: 'djl-btn djl-btn-quiet', type: 'button', disabled: busy !== '', onClick: () => void checkUpdate(false) },
+              busy === 'update' ? t('checkingUpdate') : t('checkUpdate'),
+            ),
+            updateInfo && updateInfo.supported && updateInfo.updateAvailable
+              ? h(
+                  'button',
+                  { className: 'djl-btn', type: 'button', disabled: busy !== '', onClick: () => void runUpdate() },
+                  busy === 'updating' ? t('updating') : `${t('applyUpdate')} ${updateInfo.latestVersion || ''}`.trim(),
+                )
+              : null,
+            updateText ? h('span', { className: 'djl-update-text', title: updateText }, updateText) : null,
           ),
 
           banner

@@ -31,13 +31,23 @@ Agent 工具（与面板共用同一套 Host 代码）：
 
 Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工具调用的是同一批函数，不存在两份实现。
 
+## 更新
+
+面板标题下方有 `v1.4.0 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
+
+- **npm 安装**：会向已配置的 registry 查询本插件的最新版本；发现更新时出现「更新到 x.y.z」，点一下就由 DSH 插件管理器完成安装（与 `install_plugin` 同一条 pnpm 路径），并提示是否需要重启 DSH；
+- **本地目录安装**：不自动更新，会直接说明原因（改源码后重新安装即可）；
+- **git 安装**：不自动更新，需要换新的 ref，或改用 npm 发布后自动更新。
+
+任何安装都只在**你点击时**发生，不做静默升级。
+
 ## 安装
 
 任选一种，目标都是交给 DSH 的 Plugin Manager（`install_bundle`）：
 
 ```text
 # npm
-dsh-jenkins-panel@1.3.0
+dsh-jenkins-panel@1.4.0
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>

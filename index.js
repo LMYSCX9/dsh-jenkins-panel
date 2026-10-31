@@ -12,6 +12,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const ROUTE_PREFIX = '/dsh-jenkins'
 const DEFAULT_TIMEOUT_MS = 20000
@@ -608,6 +609,126 @@ function resolveJob(jobs, wanted) {
   throw new Error(`「${needle}」匹配到多个任务：${fuzzy.slice(0, 6).map((job) => job.name).join('、')}`)
 }
 
+/* -------------------------------------------------------------------- update */
+
+const SELF = (() => {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url))
+    const pkg = JSON.parse(readFileSync(path.join(here, 'package.json'), 'utf8'))
+    return {
+      name: typeof pkg.name === 'string' ? pkg.name : '',
+      version: typeof pkg.version === 'string' ? pkg.version : '',
+    }
+  } catch {
+    return { name: '', version: '' }
+  }
+})()
+
+/** Compare two version strings; returns -1, 0 or 1. Pre-release suffixes sort before the release. */
+function compareVersions(left, right) {
+  const parse = (value) =>
+    String(value === undefined || value === null ? '' : value)
+      .replace(/^v/i, '')
+      .split(/[.+-]/)
+      .filter((part) => part !== '')
+      .map((part) => {
+        const numeric = Number(part)
+        return Number.isFinite(numeric) && /^\d+$/.test(part) ? numeric : part
+      })
+  const a = parse(left)
+  const b = parse(right)
+  const length = Math.max(a.length, 3)
+  for (let index = 0; index < length; index += 1) {
+    const l = a[index]
+    const r = b[index]
+    if (l === undefined) return r === undefined ? 0 : -1
+    if (r === undefined) return 1
+    if (typeof l === 'number' && typeof r === 'number') {
+      if (l !== r) return l < r ? -1 : 1
+      continue
+    }
+    if (typeof l === 'number') return 1
+    if (typeof r === 'number') return -1
+    if (String(l) !== String(r)) return String(l) < String(r) ? -1 : 1
+  }
+  return 0
+}
+
+function isLocalSpec(target) {
+  return (
+    /^file:/i.test(target) ||
+    /^[a-zA-Z]:[\\/]/.test(target) ||
+    target.startsWith('/') ||
+    target.startsWith('.\\') ||
+    target.startsWith('./') ||
+    target.startsWith('..')
+  )
+}
+
+/**
+ * Resolve whether a newer release exists for this plugin's own install target.
+ * Only registry installs can be updated in place; local and git installs say why not.
+ */
+async function checkForUpdate(manager) {
+  const base = { name: SELF.name, currentVersion: SELF.version }
+  if (!manager || typeof manager.listBundles !== 'function') {
+    return { ...base, supported: false, reason: '当前环境没有插件管理器，无法自更新' }
+  }
+  let entry = null
+  try {
+    const bundles = await manager.listBundles()
+    if (Array.isArray(bundles)) entry = bundles.find((bundle) => bundle && bundle.name === SELF.name) || null
+  } catch (error) {
+    return { ...base, supported: false, reason: `读取已安装信息失败：${errorMessage(error)}` }
+  }
+  if (!entry) return { ...base, supported: false, reason: '插件管理器没有列出本插件（可能是本地目录安装）' }
+
+  const target = entry.installTarget && typeof entry.installTarget.spec === 'string' ? entry.installTarget.spec : ''
+  const source = typeof entry.source === 'string' ? entry.source : ''
+  if (!target) return { ...base, supported: false, source, reason: '没有可用的安装来源，无法自更新' }
+  if (isLocalSpec(target)) {
+    return { ...base, supported: false, target, source, reason: '当前是本地目录安装：改源码后重新安装即可，不通过市场更新' }
+  }
+  if (/^git\+/i.test(target) || /^https?:\/\/.*\.git/i.test(target)) {
+    return { ...base, supported: false, target, source, reason: '当前是 git 安装：更新需要指定新的 ref，或改用 npm 发布后自动更新' }
+  }
+  if (typeof manager.inspect !== 'function') {
+    return { ...base, supported: false, target, source, reason: '插件管理器不支持版本查询' }
+  }
+
+  let inspection
+  try {
+    inspection = await manager.inspect(target)
+  } catch (error) {
+    return { ...base, supported: true, target, source, reason: `检查更新失败：${errorMessage(error)}` }
+  }
+  if (!inspection || inspection.status !== 'accepted') {
+    return { ...base, supported: true, target, source, reason: (inspection && inspection.reason) || '无法解析更新源' }
+  }
+  const latestVersion = typeof inspection.version === 'string' ? inspection.version : ''
+  return {
+    ...base,
+    supported: true,
+    target,
+    source,
+    latestVersion,
+    updateAvailable: latestVersion ? compareVersions(latestVersion, SELF.version) > 0 : false,
+  }
+}
+
+async function applyUpdate(manager, approvedBuilds) {
+  if (!manager || typeof manager.installBundle !== 'function') throw new Error('当前环境没有插件管理器，无法更新')
+  const info = await checkForUpdate(manager)
+  if (!info.supported) throw new Error(info.reason || '当前安装方式不支持自动更新')
+  if (!info.updateAvailable) throw new Error(`已经是最新版本 ${info.currentVersion || ''}`.trim())
+  const result = await manager.installBundle(info.target, {
+    enabled: true,
+    saveExact: true,
+    ...(Array.isArray(approvedBuilds) && approvedBuilds.length > 0 ? { approvedBuilds } : {}),
+  })
+  return { ...info, result }
+}
+
 /* --------------------------------------------------------------------- routes */
 
 function isLoopback(req) {
@@ -678,6 +799,21 @@ function createRouteHandler(store) {
 
       if (route === '/state') {
         sendJson(res, 200, { ok: true, ...publicState(state) })
+        return
+      }
+
+      if (route === '/update') {
+        const info = await checkForUpdate(store.manager ? store.manager() : null)
+        sendJson(res, 200, { ok: true, ...info })
+        return
+      }
+
+      if (route === '/update/apply' && req.method === 'POST') {
+        const approved = Array.isArray(body.approvedBuilds)
+          ? body.approvedBuilds.filter((entry) => typeof entry === 'string')
+          : []
+        const result = await applyUpdate(store.manager ? store.manager() : null, approved)
+        sendJson(res, 200, { ok: true, ...result })
         return
       }
 
@@ -814,7 +950,10 @@ function describeJob(job) {
 }
 
 export function apply(ctx, config) {
-  const store = { state: loadState(config) }
+  const store = {
+    state: loadState(config),
+    manager: () => (typeof ctx.get === 'function' ? ctx.get('pluginManager') : null),
+  }
   const handle = createRouteHandler(store)
 
   const connectionParam = {
