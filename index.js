@@ -960,8 +960,10 @@ function looksLikeGitSource(value) {
 /**
  * A git install has no registry version, so update means "the tip of the default branch".
  * DSH's manager.inspect validates git specs but never returns a version for them,
- * so the tip's version is read straight from the repo's package.json instead:
- * jsDelivr first (reachable from CN networks), then raw.githubusercontent.com.
+ * so the tip's version is read straight from the repo's package.json instead.
+ * jsDelivr caches branch content and can serve a stale version long after a push,
+ * while raw.githubusercontent.com is always live — both mirrors are queried and
+ * the newest reported version wins.
  */
 async function checkGitUpdate(remote, base) {
   const github = /^https?:\/\/(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(remote)
@@ -973,9 +975,10 @@ async function checkGitUpdate(remote, base) {
   const problems = []
   for (const ref of ['main', 'master']) {
     const urls = [
-      `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
       `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/package.json`,
+      `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
     ]
+    let best = null
     for (const url of urls) {
       let text = ''
       try {
@@ -1001,15 +1004,20 @@ async function checkGitUpdate(remote, base) {
         problems.push(`${new URL(url).host} → package.json 没有 version`)
         continue
       }
+      if (!best || compareVersions(latestVersion, best.latestVersion) > 0) {
+        best = { ref, latestVersion }
+      }
+    }
+    if (best) {
       return {
         ...base,
         supported: true,
         kind: 'git',
-        target: `git+${remote}#${ref}`,
+        target: `git+${remote}#${best.ref}`,
         source: remote,
-        ref,
-        latestVersion,
-        updateAvailable: compareVersions(latestVersion, SELF.version) > 0,
+        ref: best.ref,
+        latestVersion: best.latestVersion,
+        updateAvailable: compareVersions(best.latestVersion, SELF.version) > 0,
       }
     }
   }
