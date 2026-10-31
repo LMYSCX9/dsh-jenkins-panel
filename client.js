@@ -761,6 +761,38 @@ window.__ModuleLoader__.load({
         }
       }, [applyState])
 
+      const checkUpdate = useCallback(async (silent) => {
+        if (!silent) setBusy('update')
+        try {
+          const info = await callApi('/update')
+          if (info && info.ok) {
+            setUpdateInfo(info)
+          } else if (!silent) {
+            setBanner({ kind: 'error', text: (info && info.error) || '检查更新失败' })
+          }
+        } catch (error) {
+          if (!silent) setBanner({ kind: 'error', text: error.message })
+        } finally {
+          if (!silent) setBusy('')
+        }
+      }, [])
+
+      const runUpdate = useCallback(async () => {
+        setBusy('updating')
+        setBanner(null)
+        try {
+          const result = await callApi('/update/apply', {})
+          if (!result.ok) throw new Error(result.error || '更新失败')
+          setUpdateInfo(result)
+          const application = result.result ? result.result.application : ''
+          setBanner({ kind: 'ok', text: application === 'restart-required' ? t('updateRestart') : t('updateDone') })
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [])
+
       useEffect(() => {
         void bootstrap()
         const updateTimer = setTimeout(() => {
@@ -912,38 +944,6 @@ window.__ModuleLoader__.load({
         },
         [applyState],
       )
-
-      const checkUpdate = useCallback(async (silent) => {
-        if (!silent) setBusy('update')
-        try {
-          const info = await callApi('/update')
-          if (info && info.ok) {
-            setUpdateInfo(info)
-          } else if (!silent) {
-            setBanner({ kind: 'error', text: (info && info.error) || '检查更新失败' })
-          }
-        } catch (error) {
-          if (!silent) setBanner({ kind: 'error', text: error.message })
-        } finally {
-          if (!silent) setBusy('')
-        }
-      }, [])
-
-      const runUpdate = useCallback(async () => {
-        setBusy('updating')
-        setBanner(null)
-        try {
-          const result = await callApi('/update/apply', {})
-          if (!result.ok) throw new Error(result.error || '更新失败')
-          setUpdateInfo(result)
-          const application = result.result ? result.result.application : ''
-          setBanner({ kind: 'ok', text: application === 'restart-required' ? t('updateRestart') : t('updateDone') })
-        } catch (error) {
-          setBanner({ kind: 'error', text: error.message })
-        } finally {
-          setBusy('')
-        }
-      }, [])
 
       const refresh = useCallback(async () => {
         setBusy('refresh')
