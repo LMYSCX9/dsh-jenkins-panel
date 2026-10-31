@@ -575,7 +575,12 @@ window.__ModuleLoader__.load({
         setBusy('updating')
         setBanner(null)
         try {
-          const result = await callApi('/update/apply', {})
+          // Pass what the last check saw: the mirrors are flaky, so a second
+          // query right before installing can fail or serve a stale version.
+          const result = await callApi('/update/apply', {
+            latestVersion: updateInfo && updateInfo.latestVersion ? updateInfo.latestVersion : undefined,
+            target: updateInfo && updateInfo.target ? updateInfo.target : undefined,
+          })
           if (!result.ok) throw new Error(result.error || '更新失败')
           setUpdateInfo(result)
           const application = result.result ? result.result.application : ''
@@ -585,7 +590,7 @@ window.__ModuleLoader__.load({
         } finally {
           setBusy('')
         }
-      }, [])
+      }, [updateInfo])
 
       useEffect(() => {
         void bootstrap()

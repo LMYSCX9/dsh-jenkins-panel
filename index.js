@@ -1058,9 +1058,9 @@ function looksLikeGitSource(value) {
  * A git install has no registry version, so update means "the tip of the default branch".
  * DSH's manager.inspect validates git specs but never returns a version for them,
  * so the tip's version is read straight from the repo's package.json instead.
- * jsDelivr caches branch content and can serve a stale version long after a push,
- * while raw.githubusercontent.com is always live — both mirrors are queried and
- * the newest reported version wins.
+ * Mirrors disagree: jsDelivr caches branch content and can serve a stale
+ * package.json long after a push, and raw.githubusercontent.com is flaky from
+ * CN networks — so every mirror is queried and the newest reported version wins.
  */
 async function checkGitUpdate(remote, base) {
   const github = /^https?:\/\/(?:www\.)?github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i.exec(remote)
@@ -1069,17 +1069,32 @@ async function checkGitUpdate(remote, base) {
   }
   const owner = github[1]
   const repo = github[2].replace(/\.git$/i, '')
+  // jsDelivr caches branch tips; ask it to drop them before reading (best-effort).
+  for (const ref of ['main', 'master']) {
+    try {
+      await fetch(`https://purge.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`, {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(8000),
+      })
+    } catch {
+      /* the purge is advisory; the read below still happens */
+    }
+  }
   const problems = []
   for (const ref of ['main', 'master']) {
     const urls = [
       `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/package.json`,
+      `https://api.github.com/repos/${owner}/${repo}/contents/package.json?ref=${ref}`,
       `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
     ]
     let best = null
     for (const url of urls) {
       let text = ''
       try {
-        const response = await fetch(url, { signal: AbortSignal.timeout(15000) })
+        const response = await fetch(url, {
+          headers: { accept: 'application/json' },
+          signal: AbortSignal.timeout(15000),
+        })
         if (!response.ok) {
           problems.push(`${new URL(url).host} → HTTP ${response.status}`)
           continue
@@ -1095,6 +1110,15 @@ async function checkGitUpdate(remote, base) {
       } catch {
         problems.push(`${new URL(url).host} → 响应不是 JSON`)
         continue
+      }
+      // api.github.com answers with { content: <base64>, encoding: 'base64' }.
+      if (manifest && manifest.encoding === 'base64' && typeof manifest.content === 'string') {
+        try {
+          manifest = JSON.parse(Buffer.from(manifest.content, 'base64').toString('utf8'))
+        } catch {
+          problems.push(`${new URL(url).host} → 解码失败`)
+          continue
+        }
       }
       const latestVersion = typeof manifest.version === 'string' ? manifest.version : ''
       if (!latestVersion) {
@@ -1122,8 +1146,27 @@ async function checkGitUpdate(remote, base) {
     ...base,
     supported: false,
     source: remote,
-    reason: `git 安装：无法读取远端版本${problems.length ? `（${problems.slice(0, 2).join('；')}）` : ''}`,
+    reason: `git 安装：无法读取远端版本${problems.length ? `（${problems.slice(0, 3).join('；')}）` : ''}`,
   }
+}
+
+// Highest remote version observed in this process. The update mirrors
+// disagree (jsDelivr caches branch tips, raw.githubusercontent.com is flaky
+// from CN networks), so a later check can see an OLDER version than an
+// earlier one; never report below what we have already seen.
+let highestSeenRemoteVersion = ''
+
+/**
+ * Raise `info` to the version high-water mark: a version observed before is
+ * real, so a stale mirror read must not withdraw it.
+ */
+function withVersionFloor(info) {
+  if (!info || !info.supported || typeof info.latestVersion !== 'string' || !info.latestVersion) return info
+  if (compareVersions(info.latestVersion, highestSeenRemoteVersion) > 0) highestSeenRemoteVersion = info.latestVersion
+  if (compareVersions(highestSeenRemoteVersion, info.latestVersion) > 0) {
+    return { ...info, latestVersion: highestSeenRemoteVersion, updateAvailable: compareVersions(highestSeenRemoteVersion, SELF.version) > 0 }
+  }
+  return info
 }
 
 /**
@@ -1155,9 +1198,9 @@ async function checkForUpdate(manager) {
 
   // A git install may not report an installTarget at all; its `source` carries the remote.
   const gitRemote = gitRemoteOf(target) || gitRemoteOf(source)
-  if (gitRemote) return checkGitUpdate(gitRemote, base)
+  if (gitRemote) return withVersionFloor(await checkGitUpdate(gitRemote, base))
   // Unrecognised git shorthand: hand the manager's own source string back to it.
-  if (looksLikeGitSource(source)) return checkGitUpdate(gitSpecBase(source), base)
+  if (looksLikeGitSource(source)) return withVersionFloor(await checkGitUpdate(gitSpecBase(source), base))
 
   if (!target) return { ...base, supported: false, source, reason: `没有可用的安装来源，无法自更新（来源：${source || '未知'}）` }
   if (typeof manager.inspect !== 'function') {
@@ -1178,19 +1221,35 @@ async function checkForUpdate(manager) {
     return { ...base, supported: true, target, source, reason: (inspection && inspection.reason) || '无法解析更新源' }
   }
   const latestVersion = typeof inspection.version === 'string' ? inspection.version : ''
-  return {
+  return withVersionFloor({
     ...base,
     supported: true,
     target: latestVersion ? `${SELF.name}@${latestVersion}` : latestSpec,
     source,
     latestVersion,
     updateAvailable: latestVersion ? compareVersions(latestVersion, SELF.version) > 0 : false,
-  }
+  })
 }
 
-async function applyUpdate(manager, approvedBuilds) {
+async function applyUpdate(manager, approvedBuilds, known) {
   if (!manager || typeof manager.installBundle !== 'function') throw new Error('当前环境没有插件管理器，无法更新')
-  const info = await checkForUpdate(manager)
+  const knownVersion = known && typeof known.latestVersion === 'string' ? known.latestVersion : ''
+  let info
+  if (known && typeof known.target === 'string' && known.target && knownVersion && compareVersions(knownVersion, SELF.version) > 0) {
+    // The client just checked and saw this version. Trust it instead of
+    // re-querying the flaky mirrors, which can fail or serve a stale answer.
+    if (compareVersions(knownVersion, highestSeenRemoteVersion) > 0) highestSeenRemoteVersion = knownVersion
+    info = {
+      name: SELF.name,
+      currentVersion: SELF.version,
+      supported: true,
+      target: known.target,
+      latestVersion: knownVersion,
+      updateAvailable: true,
+    }
+  } else {
+    info = await checkForUpdate(manager)
+  }
   if (!info.supported) throw new Error(info.reason || '当前安装方式不支持自动更新')
   if (!info.updateAvailable) throw new Error(`已经是最新版本 ${info.currentVersion || ''}`.trim())
   const result = await manager.installBundle(info.target, {
@@ -1198,6 +1257,13 @@ async function applyUpdate(manager, approvedBuilds) {
     saveExact: true,
     ...(Array.isArray(approvedBuilds) && approvedBuilds.length > 0 ? { approvedBuilds } : {}),
   })
+  // The manager resolves failed installs instead of rejecting them
+  // (application: 'failed' | 'cancelled', error: { code, diagnostic }).
+  const application = result && result.application
+  if (application === 'failed' || application === 'cancelled') {
+    const detail = result.error && (result.error.diagnostic || result.error.code) ? `：${result.error.diagnostic || result.error.code}` : ''
+    throw new Error(`更新没有安装成功（${application === 'cancelled' ? '已取消' : '安装失败'}）${detail}`)
+  }
   return { ...info, result }
 }
 
@@ -1284,7 +1350,12 @@ function createRouteHandler(store) {
         const approved = Array.isArray(body.approvedBuilds)
           ? body.approvedBuilds.filter((entry) => typeof entry === 'string')
           : []
-        const result = await applyUpdate(store.manager ? store.manager() : null, approved)
+        // The version the client just saw: preferred over a fresh mirror query.
+        const known = {
+          latestVersion: typeof body.latestVersion === 'string' ? body.latestVersion : '',
+          target: typeof body.target === 'string' ? body.target : '',
+        }
+        const result = await applyUpdate(store.manager ? store.manager() : null, approved, known)
         sendJson(res, 200, { ok: true, ...result })
         return
       }
