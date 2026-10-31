@@ -39,9 +39,19 @@ function settingsFile() {
   return path.join(home, 'jenkins', 'settings.json')
 }
 
-function coerceSettings(input) {
+const CONNECTION_ID = /^[a-z0-9-]{6,64}$/i
+
+function newConnectionId() {
+  return `c${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+}
+
+/** One Jenkins server. The token is stored on disk but never returned by a read. */
+function coerceConnection(input, fallbackName) {
   const raw = input && typeof input === 'object' ? input : {}
+  const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : ''
   return {
+    id: typeof raw.id === 'string' && CONNECTION_ID.test(raw.id) ? raw.id : newConnectionId(),
+    name: name || fallbackName || 'Jenkins',
     baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl.trim() : '',
     username: typeof raw.username === 'string' ? raw.username.trim() : '',
     token: typeof raw.token === 'string' ? raw.token.trim() : '',
@@ -50,23 +60,52 @@ function coerceSettings(input) {
   }
 }
 
-function loadSettings(config) {
-  let stored = null
+function readStoredSettings() {
   const file = settingsFile()
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8'))
-    if (parsed && typeof parsed === 'object') stored = parsed
+    return parsed && typeof parsed === 'object' ? parsed : null
   } catch (error) {
     if (error && error.code !== 'ENOENT') warn(`读取设置文件失败（${file}）：${errorMessage(error)}`)
+    return null
   }
-  const merged = { ...coerceSettings(config), ...(stored || {}) }
-  return coerceSettings(merged)
 }
 
-function persistSettings(settings) {
+/** Patch config may hold one connection (legacy shape) or a `connections` list. */
+function connectionsFromConfig(config) {
+  const source = config && typeof config === 'object' ? config : {}
+  if (Array.isArray(source.connections)) {
+    return source.connections.map((entry, index) => coerceConnection(entry, `连接 ${index + 1}`))
+  }
+  if (typeof source.baseUrl === 'string' && source.baseUrl.trim()) return [coerceConnection(source, 'Jenkins')]
+  return []
+}
+
+function loadState(config) {
+  const stored = readStoredSettings()
+  let connections
+  let activeId = ''
+  if (stored && Array.isArray(stored.connections)) {
+    connections = stored.connections.map((entry, index) => coerceConnection(entry, `连接 ${index + 1}`))
+    activeId = typeof stored.activeId === 'string' ? stored.activeId : ''
+  } else if (stored && typeof stored.baseUrl === 'string' && stored.baseUrl.trim()) {
+    // v1 file: one flat connection, migrated in place.
+    const migrated = coerceConnection(stored, '默认连接')
+    connections = [migrated]
+    activeId = migrated.id
+  } else {
+    connections = connectionsFromConfig(config)
+    activeId = connections[0] ? connections[0].id : ''
+  }
+  if (!connections.some((entry) => entry.id === activeId)) activeId = connections[0] ? connections[0].id : ''
+  return { connections, activeId }
+}
+
+function persistState(state) {
   const file = settingsFile()
   mkdirSync(path.dirname(file), { recursive: true })
-  writeFileSync(file, `${JSON.stringify(settings, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+  const payload = { version: 2, activeId: state.activeId, connections: state.connections }
+  writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   try {
     chmodSync(file, 0o600)
   } catch {
@@ -75,16 +114,42 @@ function persistSettings(settings) {
   return file
 }
 
-function publicSettings(settings) {
+function publicConnection(connection) {
   return {
-    baseUrl: settings.baseUrl,
-    username: settings.username,
-    hasToken: settings.token.length > 0,
-    insecureTls: settings.insecureTls,
-    jobFilter: settings.jobFilter,
-    settingsFile: settingsFile(),
-    configured: normalizeBaseUrlOrEmpty(settings.baseUrl) !== '',
+    id: connection.id,
+    name: connection.name,
+    baseUrl: connection.baseUrl,
+    username: connection.username,
+    hasToken: connection.token.length > 0,
+    insecureTls: connection.insecureTls,
+    jobFilter: connection.jobFilter,
+    configured: normalizeBaseUrlOrEmpty(connection.baseUrl) !== '',
   }
+}
+
+function publicState(state) {
+  return {
+    activeId: state.activeId,
+    connections: state.connections.map(publicConnection),
+    settingsFile: settingsFile(),
+  }
+}
+
+/** Resolve a connection by id, then by name; an empty reference means the active one. */
+function resolveConnection(state, reference) {
+  const ref = typeof reference === 'string' ? reference.trim() : ''
+  if (!ref) {
+    const active = state.connections.find((entry) => entry.id === state.activeId)
+    if (!active) throw new Error('还没有配置任何 Jenkins 连接，请先在面板里添加一个')
+    return active
+  }
+  const byId = state.connections.find((entry) => entry.id === ref)
+  if (byId) return byId
+  const lowered = ref.toLowerCase()
+  const byName = state.connections.find((entry) => entry.name.toLowerCase() === lowered)
+  if (byName) return byName
+  const names = state.connections.map((entry) => entry.name).join('、')
+  throw new Error(`找不到 Jenkins 连接「${ref}」${names ? `，现有连接：${names}` : ''}`)
 }
 
 /* ---------------------------------------------------------------------- urls */
@@ -591,7 +656,7 @@ function readJsonBody(req) {
   })
 }
 
-function createRouteHandler(state) {
+function createRouteHandler(store) {
   return async function handle(req, res) {
     if (!isLoopback(req)) {
       sendJson(res, 403, { ok: false, error: '只接受本机请求' })
@@ -607,45 +672,92 @@ function createRouteHandler(state) {
     }
 
     try {
-      if (route === '/state' && req.method === 'GET') {
-        sendJson(res, 200, { ok: true, settings: publicSettings(state.settings) })
-        return
-      }
-
+      const state = store.state
       const body = req.method === 'POST' ? await readJsonBody(req) : {}
-      const settings = state.settings
+      const reference = typeof body.connection === 'string' ? body.connection : ''
 
-      if (route === '/settings' && req.method === 'POST') {
-        const next = coerceSettings({
-          baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : settings.baseUrl,
-          username: typeof body.username === 'string' ? body.username : settings.username,
-          token: typeof body.token === 'string' && body.token.length > 0 ? body.token : settings.token,
-          insecureTls: typeof body.insecureTls === 'boolean' ? body.insecureTls : settings.insecureTls,
-          jobFilter: typeof body.jobFilter === 'string' ? body.jobFilter : settings.jobFilter,
-        })
-        if (body.clearToken === true) next.token = ''
-        next.baseUrl = normalizeBaseUrl(next.baseUrl)
-        state.settings = next
-        const file = persistSettings(next)
-        sendJson(res, 200, { ok: true, settings: publicSettings(next), savedTo: file })
+      if (route === '/state') {
+        sendJson(res, 200, { ok: true, ...publicState(state) })
         return
       }
+
+      // Upsert one connection. `/settings` is kept as an alias for older clients.
+      if ((route === '/connection/save' || route === '/settings') && req.method === 'POST') {
+        let target = null
+        const wantedId = typeof body.id === 'string' && body.id ? body.id : ''
+        if (wantedId) {
+          target = state.connections.find((entry) => entry.id === wantedId) || null
+          if (!target) throw new Error(`找不到连接：${wantedId}`)
+        }
+        const merged = coerceConnection(
+          {
+            id: target ? target.id : undefined,
+            name: typeof body.name === 'string' && body.name.trim() ? body.name : target ? target.name : '',
+            baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : target ? target.baseUrl : '',
+            username: typeof body.username === 'string' ? body.username : target ? target.username : '',
+            token: typeof body.token === 'string' && body.token.length > 0 ? body.token : target ? target.token : '',
+            insecureTls: typeof body.insecureTls === 'boolean' ? body.insecureTls : target ? target.insecureTls : true,
+            jobFilter: typeof body.jobFilter === 'string' ? body.jobFilter : target ? target.jobFilter : '',
+          },
+          target ? target.name : `连接 ${state.connections.length + 1}`,
+        )
+        if (body.clearToken === true) merged.token = ''
+        merged.baseUrl = normalizeBaseUrl(merged.baseUrl)
+        if (target) {
+          state.connections = state.connections.map((entry) => (entry.id === target.id ? merged : entry))
+        } else {
+          state.connections = [...state.connections, merged]
+        }
+        // A newly created connection becomes active; an edited one only when asked.
+        if (!target || body.makeActive === true) state.activeId = merged.id
+        const file = persistState(state)
+        sendJson(res, 200, { ok: true, ...publicState(state), savedTo: file, id: merged.id })
+        return
+      }
+
+      if (route === '/connection/remove' && req.method === 'POST') {
+        const target = resolveConnection(state, typeof body.id === 'string' ? body.id : '')
+        state.connections = state.connections.filter((entry) => entry.id !== target.id)
+        if (!state.connections.some((entry) => entry.id === state.activeId)) {
+          state.activeId = state.connections[0] ? state.connections[0].id : ''
+        }
+        const file = persistState(state)
+        sendJson(res, 200, { ok: true, ...publicState(state), savedTo: file })
+        return
+      }
+
+      if (route === '/connection/active' && req.method === 'POST') {
+        const target = resolveConnection(state, typeof body.id === 'string' ? body.id : '')
+        state.activeId = target.id
+        const file = persistState(state)
+        sendJson(res, 200, { ok: true, ...publicState(state), savedTo: file })
+        return
+      }
+
+      // Everything below works on one connection: the named one, else the active one.
+      const connection = resolveConnection(state, reference)
 
       if (route === '/test' && req.method === 'POST') {
-        const result = await createJenkins(settings).testConnection()
-        sendJson(res, 200, { ok: true, ...result, settings: publicSettings(settings) })
+        const result = await createJenkins(connection).testConnection()
+        sendJson(res, 200, { ok: true, ...result, connection: publicConnection(connection) })
         return
       }
 
       if (route === '/jobs' && req.method === 'POST') {
-        const jenkins = createJenkins(settings)
+        const jenkins = createJenkins(connection)
         const jobs = await jenkins.listJobs()
-        sendJson(res, 200, { ok: true, jobs, baseUrl: jenkins.baseUrl, fetchedAt: Date.now() })
+        sendJson(res, 200, {
+          ok: true,
+          jobs,
+          baseUrl: jenkins.baseUrl,
+          connection: publicConnection(connection),
+          fetchedAt: Date.now(),
+        })
         return
       }
 
       if (route === '/builds' && req.method === 'POST') {
-        const jenkins = createJenkins(settings)
+        const jenkins = createJenkins(connection)
         let jobUrl = typeof body.url === 'string' ? body.url.trim() : ''
         if (!jobUrl) {
           const jobs = await jenkins.listJobs()
@@ -657,13 +769,13 @@ function createRouteHandler(state) {
       }
 
       if (route === '/queue' && req.method === 'POST') {
-        const items = await createJenkins(settings).listQueue()
+        const items = await createJenkins(connection).listQueue()
         sendJson(res, 200, { ok: true, items })
         return
       }
 
       if (route === '/build' && req.method === 'POST') {
-        const jenkins = createJenkins(settings)
+        const jenkins = createJenkins(connection)
         let jobUrl = typeof body.url === 'string' ? body.url.trim() : ''
         let name = typeof body.job === 'string' ? body.job : ''
         if (!jobUrl) {
@@ -672,7 +784,7 @@ function createRouteHandler(state) {
           name = job.name
         }
         const result = await jenkins.triggerBuild(jobUrl, body.params)
-        sendJson(res, 200, { ok: true, job: name, ...result })
+        sendJson(res, 200, { ok: true, job: name, connection: publicConnection(connection), ...result })
         return
       }
 
@@ -702,8 +814,13 @@ function describeJob(job) {
 }
 
 export function apply(ctx, config) {
-  const state = { settings: loadSettings(config) }
-  const handle = createRouteHandler(state)
+  const store = { state: loadState(config) }
+  const handle = createRouteHandler(store)
+
+  const connectionParam = {
+    type: 'string',
+    description: 'Connection id or name. Omit it to use the active connection.',
+  }
 
   ctx.inject(['webServer'], (scoped) => {
     scoped.effect(
@@ -722,57 +839,110 @@ export function apply(ctx, config) {
   ctx.inject(['tools'], (scoped) => {
     const definitions = [
       {
+        name: 'jenkins_connections',
+        description:
+          'List the configured Jenkins connections: id, name, base URL, user name, whether a token is stored, and which connection is active. Tokens themselves are never returned.',
+        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        output: textOutput,
+        async execute() {
+          return { ok: true, ...publicState(store.state) }
+        },
+      },
+      {
         name: 'jenkins_configure',
         description:
-          'Save the Jenkins connection used by the Jenkins sidebar panel and by the other jenkins_* tools: base URL, user name, API token, self-signed-certificate tolerance, and an optional job filter. The token is stored in the plugin settings file and never returned by reads.',
+          'Create or update one Jenkins connection among several. Pass `connection` (id or name) to update an existing one, or just `name` plus the details to add a new one; a new or `setActive: true` connection becomes the active one. The token is stored in the plugin settings file and never returned by reads.',
         parameters: {
           type: 'object',
           properties: {
+            connection: connectionParam,
+            name: { type: 'string', description: 'Display name, e.g. 公司机房 or 测试环境. Used to address the connection later.' },
             baseUrl: { type: 'string', description: 'Jenkins root URL, for example http://ci.example.com:8080 or http://host/jenkins.' },
             username: { type: 'string', description: 'Jenkins user name.' },
             token: { type: 'string', description: 'Jenkins API token (or password for older servers).' },
             insecureTls: { type: 'boolean', description: 'Accept self-signed HTTPS certificates. Defaults to the current value.' },
             jobFilter: { type: 'string', description: 'Only list job names containing this text. Empty lists everything.' },
+            setActive: { type: 'boolean', description: 'Make this connection the active one.' },
           },
-          required: ['baseUrl'],
           additionalProperties: false,
         },
         output: textOutput,
         async execute(args) {
-          const next = coerceSettings({
-            ...state.settings,
-            ...(args && typeof args === 'object' ? args : {}),
-          })
-          next.baseUrl = normalizeBaseUrl(next.baseUrl)
-          state.settings = next
-          const file = persistSettings(next)
-          let connection
-          try {
-            connection = await createJenkins(next).testConnection()
-          } catch (error) {
-            return { ok: false, saved: true, savedTo: file, error: errorMessage(error), settings: publicSettings(next) }
+          const input = args && typeof args === 'object' ? args : {}
+          const state = store.state
+          const reference = typeof input.connection === 'string' ? input.connection.trim() : ''
+          let target = null
+          if (reference) {
+            target = resolveConnection(state, reference)
+          } else if (typeof input.name === 'string' && input.name.trim()) {
+            const wanted = input.name.trim().toLowerCase()
+            target = state.connections.find((entry) => entry.name.toLowerCase() === wanted) || null
           }
-          return { ok: true, savedTo: file, connection, settings: publicSettings(next) }
+          const merged = coerceConnection(
+            {
+              id: target ? target.id : undefined,
+              name: typeof input.name === 'string' && input.name.trim() ? input.name : target ? target.name : '',
+              baseUrl: typeof input.baseUrl === 'string' ? input.baseUrl : target ? target.baseUrl : '',
+              username: typeof input.username === 'string' ? input.username : target ? target.username : '',
+              token: typeof input.token === 'string' && input.token.length > 0 ? input.token : target ? target.token : '',
+              insecureTls: typeof input.insecureTls === 'boolean' ? input.insecureTls : target ? target.insecureTls : true,
+              jobFilter: typeof input.jobFilter === 'string' ? input.jobFilter : target ? target.jobFilter : '',
+            },
+            target ? target.name : `连接 ${state.connections.length + 1}`,
+          )
+          merged.baseUrl = normalizeBaseUrl(merged.baseUrl)
+          if (target) {
+            state.connections = state.connections.map((entry) => (entry.id === target.id ? merged : entry))
+          } else {
+            state.connections = [...state.connections, merged]
+          }
+          if (!target || input.setActive === true) state.activeId = merged.id
+          const file = persistState(state)
+          let probe
+          try {
+            probe = await createJenkins(merged).testConnection()
+          } catch (error) {
+            return {
+              ok: false,
+              saved: true,
+              savedTo: file,
+              connection: publicConnection(merged),
+              error: errorMessage(error),
+              ...publicState(state),
+            }
+          }
+          return { ok: true, savedTo: file, connection: publicConnection(merged), probe, ...publicState(state) }
         },
       },
       {
         name: 'jenkins_list_jobs',
-        description: 'List Jenkins jobs (including jobs inside folders) with their last build number, result, and timestamp. Requires a configured connection.',
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        description:
+          'List Jenkins jobs (including jobs inside folders) with their last build number, result, and timestamp. Requires a configured connection.',
+        parameters: {
+          type: 'object',
+          properties: { connection: connectionParam },
+          additionalProperties: false,
+        },
         output: textOutput,
-        async execute() {
-          const jobs = await createJenkins(state.settings).listJobs()
-          return { ok: true, count: jobs.length, jobs: jobs.map(describeJob) }
+        async execute(args) {
+          const connection = resolveConnection(store.state, args && args.connection)
+          const jobs = await createJenkins(connection).listJobs()
+          return { ok: true, connection: publicConnection(connection), count: jobs.length, jobs: jobs.map(describeJob) }
         },
       },
       {
         name: 'jenkins_queue',
         description: 'List the items currently waiting in the Jenkins build queue, with the reason each one is waiting.',
-        parameters: { type: 'object', properties: {}, additionalProperties: false },
+        parameters: {
+          type: 'object',
+          properties: { connection: connectionParam },
+          additionalProperties: false,
+        },
         output: textOutput,
-        async execute() {
-          const items = await createJenkins(state.settings).listQueue()
-          return { ok: true, count: items.length, items }
+        async execute(args) {
+          const connection = resolveConnection(store.state, args && args.connection)
+          const items = await createJenkins(connection).listQueue()
+          return { ok: true, connection: publicConnection(connection), count: items.length, items }
         },
       },
       {
@@ -783,16 +953,18 @@ export function apply(ctx, config) {
           properties: {
             job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
             limit: { type: 'integer', minimum: 1, maximum: 25, description: 'How many builds to return. Defaults to 8.' },
+            connection: connectionParam,
           },
           required: ['job'],
           additionalProperties: false,
         },
         output: textOutput,
         async execute(args) {
-          const jenkins = createJenkins(state.settings)
+          const connection = resolveConnection(store.state, args && args.connection)
+          const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
           const builds = await jenkins.listBuilds(job.url, args && args.limit)
-          return { ok: true, job: { name: job.name, url: job.url }, builds }
+          return { ok: true, connection: publicConnection(connection), job: { name: job.name, url: job.url }, builds }
         },
       },
       {
@@ -809,16 +981,18 @@ export function apply(ctx, config) {
                 'Optional parameter overrides. Omit it to build with the job’s declared defaults (read from parameterDefinitions).',
               additionalProperties: true,
             },
+            connection: connectionParam,
           },
           required: ['job'],
           additionalProperties: false,
         },
         output: textOutput,
         async execute(args) {
-          const jenkins = createJenkins(state.settings)
+          const connection = resolveConnection(store.state, args && args.connection)
+          const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
           const result = await jenkins.triggerBuild(job.url, args && args.params)
-          return { ok: true, job: { name: job.name, url: job.url }, ...result }
+          return { ok: true, connection: publicConnection(connection), job: { name: job.name, url: job.url }, ...result }
         },
       },
     ]

@@ -1,6 +1,6 @@
 # dsh-jenkins
 
-DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来连接 Jenkins、查询任务、触发构建、查看队列；同样的能力同时以 5 个 Agent 工具暴露给模型。
+DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来连接 Jenkins、查询任务、触发构建、查看队列；同样的能力同时以 6 个 Agent 工具暴露给模型。支持同时配置多个 Jenkins 服务器。
 
 零运行时依赖（只用 Node 内置模块），纯 ESM，无构建步骤。
 
@@ -8,7 +8,8 @@ DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来�
 
 面板（左侧栏 → 齿轮图标，排在 Plugins / Schedules 之后）：
 
-- **连接设置**：地址、用户名、API Token、是否信任自签名证书、任务过滤；「保存并连接」会保存 → 测通 → 拉列表，失败直接回显原因。
+- **多连接**：可配置多个 Jenkins 服务器（例如「公司机房」「测试环境」），面板顶部下拉切换、可新增与删除；新建的连接自动成为当前连接。面板和所有工具默认按「当前连接」工作，也可以按名字或 id 指定某一个连接。
+- **连接设置**：名称、地址、用户名、API Token、是否信任自签名证书、任务过滤；「保存并连接」会保存 → 测通 → 拉列表，失败直接回显原因。
 - **任务列表**：递归展开文件夹，显示为 `folder/job`；状态点、上次构建号、结果、相对时间、耗时；支持搜索。
 - **触发构建**：每行「构建」按钮，自动获取 CSRF crumb，返回 Jenkins 队列地址；提交后 4 秒自动刷新。参数化任务**按各参数的默认值构建**——先读 `parameterDefinitions`，只提交有默认值的参数，不需要填表。
 - **构建历史**：每行「历史」展开最近 8 次构建。
@@ -19,11 +20,14 @@ Agent 工具（与面板共用同一套 Host 代码）：
 
 | 工具 | 作用 |
 |---|---|
-| `jenkins_configure` | 保存连接（地址 / 用户名 / Token / TLS / 过滤）并立即测通 |
+| `jenkins_connections` | 列出所有连接（id / 名称 / 地址 / 是否已存 Token）与当前连接 |
+| `jenkins_configure` | 新增或更新一个连接并立即测通；传 `connection` 改已有的，只传 `name` 则新建 |
 | `jenkins_list_jobs` | 列出任务（含文件夹内任务）与上次构建 |
-| `jenkins_build` | 触发构建，支持参数化（`buildWithParameters`） |
+| `jenkins_build` | 触发构建；参数化任务按声明默认值构建，可用 `params` 覆盖 |
 | `jenkins_builds` | 查看某任务最近若干次构建 |
 | `jenkins_queue` | 查看构建队列 |
+
+除 `jenkins_connections` / `jenkins_configure` 外，其余工具都接受可选的 `connection` 参数（连接 id 或名称），省略时使用当前连接。
 
 Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工具调用的是同一批函数，不存在两份实现。
 
@@ -33,7 +37,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ```text
 # npm
-dsh-jenkins-panel@1.2.0
+dsh-jenkins-panel@1.3.0
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
@@ -46,17 +50,18 @@ git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
 
 ## 配置
 
-在面板里填写即可，也可以在 `cordis.patch.yml` 的 `jenkins` 行给初值（面板保存的值优先）：
+在面板里新增/编辑连接即可，也可以在 `cordis.patch.yml` 的 `jenkins` 行给初值（面板保存的值优先）。每个连接都有同样的字段：
 
 | 字段 | 说明 |
 |---|---|
+| `name` | 连接名称，之后用它来指定连接，如「公司机房」 |
 | `baseUrl` | Jenkins 根地址，如 `http://ci.example.com:8080` 或 `http://host/jenkins` |
 | `username` | Jenkins 账号 |
 | `token` | API Token（Jenkins → 用户设置 → API Token） |
 | `insecureTls` | 是否跳过 HTTPS 证书校验，**默认 `true`**，使用正规证书时请取消勾选 |
 | `jobFilter` | 只显示名称包含此文本的任务，留空为全部 |
 
-保存位置：`~/.dsh/jenkins/settings.json`（权限 `0600`），可用环境变量 `DSH_JENKINS_SETTINGS` 覆盖路径。凭据不进 `cordis.patch.yml`。
+保存位置：`~/.dsh/jenkins/settings.json`（权限 `0600`），可用环境变量 `DSH_JENKINS_SETTINGS` 覆盖路径。文件结构是 `{ version: 2, activeId, connections: [...] }`；旧版的单连接文件会在启动时自动迁移成一条连接。凭据不进 `cordis.patch.yml`。
 
 ## 安全边界
 

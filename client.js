@@ -30,6 +30,11 @@ window.__ModuleLoader__.load({
         buildSubmitted: '已提交构建',
         defaultParams: '默认参数',
         connection: '连接设置',
+        connName: '连接名称',
+        connNamePlaceholder: '如 公司机房 / 测试环境',
+        addConn: '新增连接',
+        removeConn: '删除',
+        removeConfirm: '确定删除这个 Jenkins 连接？',
         collapse: '收起',
         expand: '展开',
         baseUrl: 'Jenkins 地址',
@@ -98,6 +103,11 @@ window.__ModuleLoader__.load({
         buildSubmitted: 'Build submitted',
         defaultParams: 'default parameters',
         connection: 'Connection',
+        connName: 'Name',
+        connNamePlaceholder: 'e.g. office / staging',
+        addConn: 'Add connection',
+        removeConn: 'Remove',
+        removeConfirm: 'Remove this Jenkins connection?',
         collapse: 'Collapse',
         expand: 'Edit',
         baseUrl: 'Jenkins URL',
@@ -312,6 +322,8 @@ window.__ModuleLoader__.load({
 .djl-card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px;
   padding: 12px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1); }
 .djl-card-head h2 { margin: 0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.djl-connbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.djl-select { width: auto; min-width: 160px; max-width: 240px; height: 30px; }
 .djl-count { font-weight: 400; color: var(--dsw-alias-label-secondary); font-size: 12px; }
 .djl-card-body { padding: 16px; }
 .djl-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
@@ -634,8 +646,10 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = useState(true)
       const [busy, setBusy] = useState('')
       const [banner, setBanner] = useState(null)
-      const [settings, setSettings] = useState({ baseUrl: '', username: '', hasToken: false, insecureTls: true, jobFilter: '', settingsFile: '', configured: false })
-      const [form, setForm] = useState({ baseUrl: '', username: '', token: '', insecureTls: true, jobFilter: '' })
+      const [connections, setConnections] = useState([])
+      const [selectedId, setSelectedId] = useState('')
+      const [settingsFile, setSettingsFile] = useState('')
+      const [form, setForm] = useState({ name: '', baseUrl: '', username: '', token: '', insecureTls: true, jobFilter: '' })
       const [editing, setEditing] = useState(true)
       const [jobs, setJobs] = useState([])
       const [queue, setQueue] = useState([])
@@ -645,28 +659,68 @@ window.__ModuleLoader__.load({
       const [busyJob, setBusyJob] = useState('')
       const timerRef = useRef(null)
 
-      const remember = useCallback((next) => {
-        setSettings(next)
-        setForm((current) => ({
-          baseUrl: next.baseUrl || '',
-          username: next.username || '',
-          token: current.token,
-          insecureTls: next.insecureTls !== false,
-          jobFilter: next.jobFilter || '',
-        }))
-        setEditing(!next.configured)
+      const settings = useMemo(
+        () =>
+          connections.find((item) => item.id === selectedId) || {
+            id: '',
+            name: '',
+            baseUrl: '',
+            username: '',
+            hasToken: false,
+            insecureTls: true,
+            jobFilter: '',
+            configured: false,
+          },
+        [connections, selectedId],
+      )
+
+      /** Adopt a /state (or connection operation) payload, focusing one connection. */
+      const applyState = useCallback((payload, focusId) => {
+        const list = Array.isArray(payload && payload.connections) ? payload.connections : []
+        setConnections(list)
+        setSettingsFile((payload && payload.settingsFile) || '')
+        const pick =
+          list.find((entry) => entry.id === focusId) ||
+          list.find((entry) => entry.id === (payload && payload.activeId)) ||
+          list[0] ||
+          null
+        setSelectedId(pick ? pick.id : '')
+        return pick
       }, [])
 
-      const loadJobs = useCallback(async () => {
-        const result = await callApi('/jobs', {})
+      const syncedRef = useRef(null)
+      useEffect(() => {
+        if (syncedRef.current === selectedId) return
+        syncedRef.current = selectedId
+        const entry = connections.find((item) => item.id === selectedId) || null
+        setForm({
+          name: entry ? entry.name : '',
+          baseUrl: entry ? entry.baseUrl : '',
+          username: entry ? entry.username : '',
+          token: '',
+          insecureTls: entry ? entry.insecureTls !== false : true,
+          jobFilter: entry && entry.jobFilter ? entry.jobFilter : '',
+        })
+        setEditing(!entry || !entry.configured)
+        setJobs([])
+        setQueue([])
+        setExpanded('')
+        setBuilds({})
+        setBanner(null)
+      }, [selectedId, connections])
+
+      const loadJobsFor = useCallback(async (connId) => {
+        if (!connId) return null
+        const result = await callApi('/jobs', { connection: connId })
         if (!result.ok) throw new Error(result.error || '读取任务列表失败')
         setJobs(Array.isArray(result.jobs) ? result.jobs : [])
         return result
       }, [])
 
-      const loadQueue = useCallback(async () => {
+      const loadQueueFor = useCallback(async (connId) => {
+        if (!connId) return
         try {
-          const result = await callApi('/queue', {})
+          const result = await callApi('/queue', { connection: connId })
           if (result.ok && Array.isArray(result.items)) setQueue(result.items)
         } catch {
           /* the queue is secondary: keep the page usable when only it fails */
@@ -676,18 +730,13 @@ window.__ModuleLoader__.load({
       const bootstrap = useCallback(async () => {
         setLoading(true)
         try {
-          const state = await callApi('/state')
-          const next = state.settings || {}
-          remember(next)
-          if (next.configured) {
-            await Promise.all([loadJobs().catch((error) => setBanner({ kind: 'error', text: error.message })), loadQueue()])
-          }
+          applyState(await callApi('/state'))
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setLoading(false)
         }
-      }, [remember, loadJobs, loadQueue])
+      }, [applyState])
 
       useEffect(() => {
         void bootstrap()
@@ -699,91 +748,161 @@ window.__ModuleLoader__.load({
         }
       }, [bootstrap])
 
+      // Load jobs and the queue whenever the selected connection becomes usable.
+      useEffect(() => {
+        if (!selectedId || !settings.configured) return undefined
+        let cancelled = false
+        void (async () => {
+          try {
+            await loadJobsFor(selectedId)
+          } catch (error) {
+            if (!cancelled) setBanner({ kind: 'error', text: error.message })
+          }
+          if (!cancelled) await loadQueueFor(selectedId)
+        })()
+        return () => {
+          cancelled = true
+        }
+      }, [selectedId, settings.configured, loadJobsFor, loadQueueFor])
+
       const save = useCallback(async (event) => {
         if (event) event.preventDefault()
         setBusy('save')
         setBanner(null)
         try {
           const payload = {
+            id: selectedId || undefined,
+            name: form.name,
             baseUrl: form.baseUrl,
             username: form.username,
             insecureTls: form.insecureTls,
             jobFilter: form.jobFilter,
+            makeActive: true,
           }
           if (form.token) payload.token = form.token
-          const saved = await callApi('/settings', payload)
+          const saved = await callApi('/connection/save', payload)
           if (!saved.ok) throw new Error(saved.error || '保存失败')
-          remember(saved.settings)
-          setBanner({ kind: 'ok', text: `${t('saved')} · ${t('settingsPath')} ${saved.settings.settingsFile || ''}` })
+          const pick = applyState(saved, saved.id)
+          setBanner({ kind: 'ok', text: `${t('saved')} · ${t('settingsPath')} ${saved.savedTo || settingsFile}` })
           setBusy('')
-          const test = await callApi('/test', {})
+          const test = await callApi('/test', { connection: saved.id })
           if (!test.ok) {
             setBanner({ kind: 'error', text: test.error || '连接测试失败' })
             return
           }
           setBanner({
             kind: 'ok',
-            text: `${t('testOk')} · ${test.version ? `Jenkins ${test.version}` : saved.settings.baseUrl} · ${test.latencyMs}ms`,
+            text: `${t('testOk')} · ${test.version ? `Jenkins ${test.version}` : (pick && pick.baseUrl) || ''} · ${test.latencyMs}ms`,
           })
           setBusy('refresh')
-          await Promise.all([loadJobs(), loadQueue()])
+          if (saved.id) await Promise.all([loadJobsFor(saved.id), loadQueueFor(saved.id)])
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setBusy('')
         }
-      }, [form, remember, loadJobs, loadQueue])
+      }, [form, selectedId, applyState, settingsFile, loadJobsFor, loadQueueFor])
 
       const test = useCallback(async () => {
         setBusy('test')
         setBanner(null)
         try {
-          const payload = { baseUrl: form.baseUrl, username: form.username, insecureTls: form.insecureTls, jobFilter: form.jobFilter }
+          const payload = {
+            id: selectedId || undefined,
+            name: form.name,
+            baseUrl: form.baseUrl,
+            username: form.username,
+            insecureTls: form.insecureTls,
+            jobFilter: form.jobFilter,
+            makeActive: true,
+          }
           if (form.token) payload.token = form.token
-          const saved = await callApi('/settings', payload)
+          const saved = await callApi('/connection/save', payload)
           if (!saved.ok) throw new Error(saved.error || '保存失败')
-          remember(saved.settings)
-          const result = await callApi('/test', {})
+          applyState(saved, saved.id)
+          const result = await callApi('/test', { connection: saved.id })
           if (!result.ok) throw new Error(result.error || '连接测试失败')
-          setBanner({ kind: 'ok', text: `${t('testOk')} · ${result.version ? `Jenkins ${result.version}` : saved.settings.baseUrl} · ${result.latencyMs}ms` })
+          setBanner({
+            kind: 'ok',
+            text: `${t('testOk')} · ${result.version ? `Jenkins ${result.version}` : saved.connection.baseUrl} · ${result.latencyMs}ms`,
+          })
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setBusy('')
         }
-      }, [form, remember])
+      }, [form, selectedId, applyState])
 
       const clearToken = useCallback(async () => {
         setBusy('token')
         try {
-          const saved = await callApi('/settings', { clearToken: true })
+          const saved = await callApi('/connection/save', { id: selectedId, clearToken: true })
           if (!saved.ok) throw new Error(saved.error || '保存失败')
-          remember(saved.settings)
+          applyState(saved, saved.id)
           setBanner({ kind: 'ok', text: t('saved') })
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setBusy('')
         }
-      }, [remember])
+      }, [selectedId, applyState])
 
-      const refresh = useCallback(async () => {
-        setBusy('refresh')
+      const addConnection = useCallback(() => {
+        syncedRef.current = ''
+        setSelectedId('')
+        setForm({ name: '', baseUrl: '', username: '', token: '', insecureTls: true, jobFilter: '' })
+        setEditing(true)
         setBanner(null)
+      }, [])
+
+      const removeConnection = useCallback(async () => {
+        if (!selectedId) return
+        if (typeof window !== 'undefined' && typeof window.confirm === 'function' && !window.confirm(t('removeConfirm'))) return
+        setBusy('remove')
         try {
-          await Promise.all([loadJobs(), loadQueue()])
+          const saved = await callApi('/connection/remove', { id: selectedId })
+          if (!saved.ok) throw new Error(saved.error || '删除失败')
+          applyState(saved)
+          setBanner({ kind: 'ok', text: t('saved') })
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setBusy('')
         }
-      }, [loadJobs, loadQueue])
+      }, [selectedId, applyState])
+
+      const selectConnection = useCallback(
+        async (id) => {
+          setBanner(null)
+          setSelectedId(id)
+          if (!id) return
+          try {
+            const saved = await callApi('/connection/active', { id })
+            if (saved.ok) applyState(saved, id)
+          } catch {
+            /* switching the active connection is best-effort */
+          }
+        },
+        [applyState],
+      )
+
+      const refresh = useCallback(async () => {
+        setBusy('refresh')
+        setBanner(null)
+        try {
+          await Promise.all([loadJobsFor(selectedId), loadQueueFor(selectedId)])
+        } catch (error) {
+          setBanner({ kind: 'error', text: error.message })
+        } finally {
+          setBusy('')
+        }
+      }, [selectedId, loadJobsFor, loadQueueFor])
 
       const trigger = useCallback(async (job) => {
         setBusyJob(job.name)
         setBanner(null)
         try {
-          const result = await callApi('/build', { job: job.name, url: job.url })
+          const result = await callApi('/build', { connection: selectedId, job: job.name, url: job.url })
           if (!result.ok) throw new Error(result.error || '触发构建失败')
           setBanner({ kind: 'ok', text: `${t('buildStarted')} · ${job.name}${result.usedDefaults ? ` · ${t('defaultParams')}` : ''}${result.queueUrl ? ` · ${t('buildQueuedAt')}` : ''}` })
           if (timerRef.current) clearTimeout(timerRef.current)
@@ -805,13 +924,13 @@ window.__ModuleLoader__.load({
         setExpanded(job.name)
         if (builds[job.name]) return
         try {
-          const result = await callApi('/builds', { url: job.url, limit: 8 })
+          const result = await callApi('/builds', { connection: selectedId, url: job.url, limit: 8 })
           if (!result.ok) throw new Error(result.error || '读取构建历史失败')
           setBuilds((current) => ({ ...current, [job.name]: Array.isArray(result.builds) ? result.builds : [] }))
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         }
-      }, [expanded, builds])
+      }, [expanded, builds, selectedId])
 
       const filtered = useMemo(() => {
         const needle = search.trim().toLowerCase()
@@ -824,7 +943,7 @@ window.__ModuleLoader__.load({
         ? t('connectHint')
         : chipFailed
           ? t('notConnected')
-          : `${t('connected')} · ${settings.baseUrl.replace(/^https?:\/\//, '')}`
+          : `${t('connected')} · ${settings.name ? `${settings.name} · ` : ''}${settings.baseUrl.replace(/^https?:\/\//, '')}`
 
       const field = (label, key, options) => {
         const opts = options || {}
@@ -889,15 +1008,42 @@ window.__ModuleLoader__.load({
               { className: 'djl-card-head' },
               h('h2', null, t('connection')),
               h(
-                'button',
-                { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => setEditing((value) => !value) },
-                editing ? t('collapse') : t('expand'),
+                'div',
+                { className: 'djl-connbar' },
+                connections.length > 0
+                  ? h(
+                      'select',
+                      {
+                        className: 'djl-input djl-select',
+                        value: selectedId,
+                        title: settings.baseUrl || '',
+                        onChange: (event) => void selectConnection(event.target.value),
+                      },
+                      connections.map((entry) =>
+                        h('option', { key: entry.id, value: entry.id }, entry.configured ? entry.name : `${entry.name}（未配置）`),
+                      ),
+                    )
+                  : null,
+                h('button', { className: 'djl-btn', type: 'button', disabled: busy !== '', onClick: addConnection }, t('addConn')),
+                selectedId
+                  ? h(
+                      'button',
+                      { className: 'djl-btn djl-btn-quiet', type: 'button', disabled: busy !== '', onClick: () => void removeConnection() },
+                      t('removeConn'),
+                    )
+                  : null,
+                h(
+                  'button',
+                  { className: 'djl-btn djl-btn-quiet', type: 'button', onClick: () => setEditing((value) => !value) },
+                  editing ? t('collapse') : t('expand'),
+                ),
               ),
             ),
             editing
               ? h(
                   'form',
                   { className: 'djl-card-body djl-form', onSubmit: save },
+                  field(t('connName'), 'name', { wide: true, placeholder: t('connNamePlaceholder') }),
                   field(t('baseUrl'), 'baseUrl', { wide: true, placeholder: t('baseUrlPlaceholder') }),
                   field(t('username'), 'username', { placeholder: t('usernamePlaceholder'), autoComplete: 'username' }),
                   h(
@@ -946,7 +1092,7 @@ window.__ModuleLoader__.load({
                         )
                       : null,
                   ),
-                  h('p', { className: 'djl-hint' }, `${t('settingsPath')} ${settings.settingsFile || ''}`),
+                  h('p', { className: 'djl-hint' }, `${t('settingsPath')} ${settingsFile || ''}`),
                 )
               : null,
           ),
