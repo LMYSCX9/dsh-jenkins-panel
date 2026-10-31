@@ -62,6 +62,15 @@ function coerceConnection(input, fallbackName) {
   }
 }
 
+/**
+ * Env-var-shaped name of the DSH credential-service reference that holds a
+ * connection's token. Connection ids are `[a-z0-9-]`, so uppercasing with
+ * underscores keeps the reference inside the POSIX identifier grammar.
+ */
+function tokenRefFor(connectionId) {
+  return `DSH_JENKINS_TOKEN_${String(connectionId).toUpperCase().replace(/[^A-Z0-9_]/g, '_')}`
+}
+
 function readStoredSettings() {
   const file = settingsFile()
   try {
@@ -107,7 +116,10 @@ function loadState(config) {
 function persistState(state) {
   const file = settingsFile()
   mkdirSync(path.dirname(file), { recursive: true })
-  const payload = { version: 2, activeId: state.activeId, connections: state.connections, analysis: state.analysis || {} }
+  // hasStoredToken is a transient runtime marker (token lives in the DSH
+  // credential service); it never reaches the settings file.
+  const connections = state.connections.map(({ hasStoredToken, ...connection }) => connection)
+  const payload = { version: 2, activeId: state.activeId, connections, analysis: state.analysis || {} }
   writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   try {
     chmodSync(file, 0o600)
@@ -123,7 +135,7 @@ function publicConnection(connection) {
     name: connection.name,
     baseUrl: connection.baseUrl,
     username: connection.username,
-    hasToken: connection.token.length > 0,
+    hasToken: connection.token.length > 0 || connection.hasStoredToken === true,
     insecureTls: connection.insecureTls,
     jobFilter: connection.jobFilter,
     configured: normalizeBaseUrlOrEmpty(connection.baseUrl) !== '',
@@ -154,6 +166,91 @@ function resolveConnection(state, reference) {
   if (byName) return byName
   const names = state.connections.map((entry) => entry.name).join('、')
   throw new Error(`找不到 Jenkins 连接「${ref}」${names ? `，现有连接：${names}` : ''}`)
+}
+
+/* -------------------------------------------------------- credential service */
+
+/** The token of a connection, read from the DSH credential service; '' when absent or unavailable. */
+async function credentialToken(store, connectionId) {
+  const credentials = store.credentials ? store.credentials() : null
+  if (!credentials || typeof credentials.resolve !== 'function') return ''
+  try {
+    const hit = await credentials.resolve(tokenRefFor(connectionId))
+    return hit && typeof hit.value === 'string' ? hit.value : ''
+  } catch (error) {
+    warn(`读取凭据服务失败：${errorMessage(error)}`)
+    return ''
+  }
+}
+
+/** Whether the DSH credential service holds a token for this connection. */
+async function credentialTokenConfigured(store, connectionId) {
+  const credentials = store.credentials ? store.credentials() : null
+  if (!credentials || typeof credentials.describe !== 'function') return false
+  try {
+    const info = await credentials.describe(tokenRefFor(connectionId))
+    return Boolean(info && info.configured)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Store a token in the DSH credential service. Returns false (and the caller
+ * falls back to the settings file) when no service is mounted.
+ */
+async function storeToken(store, connectionId, token) {
+  const credentials = store.credentials ? store.credentials() : null
+  if (!credentials || typeof credentials.set !== 'function') return false
+  try {
+    await credentials.set(tokenRefFor(connectionId), token)
+    return true
+  } catch (error) {
+    warn(`写入凭据服务失败：${errorMessage(error)}`)
+    return false
+  }
+}
+
+async function clearStoredToken(store, connectionId) {
+  const credentials = store.credentials ? store.credentials() : null
+  if (!credentials || typeof credentials.unset !== 'function') return
+  try {
+    await credentials.unset(tokenRefFor(connectionId))
+  } catch (error) {
+    warn(`清除凭据服务中的令牌失败：${errorMessage(error)}`)
+  }
+}
+
+/**
+ * A connection with its token filled in: the settings-file token when one is
+ * still there (legacy), otherwise the DSH credential service.
+ */
+async function resolveRuntimeConnection(store, reference) {
+  const connection = resolveConnection(store.state, reference)
+  if (connection.token) return connection
+  const token = await credentialToken(store, connection.id)
+  return token ? { ...connection, token } : connection
+}
+
+/**
+ * Boot-time sync against the credential service: mark connections whose token
+ * lives there, and migrate any token still sitting in the settings file into
+ * the service (left in place when the service is unavailable).
+ */
+async function syncCredentialTokens(store) {
+  const credentials = store.credentials ? store.credentials() : null
+  if (!credentials) return
+  for (const connection of store.state.connections) {
+    if (connection.token) {
+      if (await storeToken(store, connection.id, connection.token)) {
+        connection.token = ''
+        connection.hasStoredToken = true
+        persistState(store.state)
+      }
+    } else if (await credentialTokenConfigured(store, connection.id)) {
+      connection.hasStoredToken = true
+    }
+  }
 }
 
 /* ---------------------------------------------------------------------- urls */
@@ -1200,19 +1297,31 @@ function createRouteHandler(store) {
           target = state.connections.find((entry) => entry.id === wantedId) || null
           if (!target) throw new Error(`找不到连接：${wantedId}`)
         }
+        const incomingToken = typeof body.token === 'string' && body.token.length > 0 ? body.token : ''
         const merged = coerceConnection(
           {
             id: target ? target.id : undefined,
             name: typeof body.name === 'string' && body.name.trim() ? body.name : target ? target.name : '',
             baseUrl: typeof body.baseUrl === 'string' ? body.baseUrl : target ? target.baseUrl : '',
             username: typeof body.username === 'string' ? body.username : target ? target.username : '',
-            token: typeof body.token === 'string' && body.token.length > 0 ? body.token : target ? target.token : '',
+            token: '',
             insecureTls: typeof body.insecureTls === 'boolean' ? body.insecureTls : target ? target.insecureTls : true,
             jobFilter: typeof body.jobFilter === 'string' ? body.jobFilter : target ? target.jobFilter : '',
           },
           target ? target.name : `连接 ${state.connections.length + 1}`,
         )
-        if (body.clearToken === true) merged.token = ''
+        if (body.clearToken === true) {
+          merged.token = ''
+          await clearStoredToken(store, merged.id)
+          delete merged.hasStoredToken
+        } else if (incomingToken) {
+          // Tokens live in the DSH credential service; the settings file is
+          // only a fallback for environments where the service is not mounted.
+          if (await storeToken(store, merged.id, incomingToken)) merged.hasStoredToken = true
+          else merged.token = incomingToken
+        } else if (target) {
+          merged.token = target.token
+        }
         merged.baseUrl = normalizeBaseUrl(merged.baseUrl)
         if (target) {
           state.connections = state.connections.map((entry) => (entry.id === target.id ? merged : entry))
@@ -1260,7 +1369,7 @@ function createRouteHandler(store) {
       }
 
       // Everything below works on one connection: the named one, else the active one.
-      const connection = resolveConnection(state, reference)
+      const connection = await resolveRuntimeConnection(store, reference)
 
       if (route === '/test' && req.method === 'POST') {
         const result = await createJenkins(connection).testConnection()
@@ -1342,10 +1451,14 @@ export function apply(ctx, config) {
   const store = {
     state: loadState(config),
     manager: () => (typeof ctx.get === 'function' ? ctx.get('pluginManager') : null),
+    credentials: () => (typeof ctx.get === 'function' ? ctx.get('credentials') : null),
   }
   const handle = createRouteHandler(store)
   // Clear callbacks of all in-flight build watchers (see startFailureWatcher).
   const watchers = new Set()
+  // Move any settings-file token into the DSH credential service and refresh
+  // the has-token markers; best-effort and asynchronous.
+  void syncCredentialTokens(store)
 
   const connectionParam = {
     type: 'string',
@@ -1381,7 +1494,7 @@ export function apply(ctx, config) {
       {
         name: 'jenkins_configure',
         description:
-          'Create or update one Jenkins connection among several. Pass `connection` (id or name) to update an existing one, or just `name` plus the details to add a new one; a new or `setActive: true` connection becomes the active one. The token is stored in the plugin settings file and never returned by reads.',
+          'Create or update one Jenkins connection among several. Pass `connection` (id or name) to update an existing one, or just `name` plus the details to add a new one; a new or `setActive: true` connection becomes the active one. The token is stored in the DSH credential service and never returned by reads.',
         parameters: {
           type: 'object',
           properties: {
@@ -1408,18 +1521,27 @@ export function apply(ctx, config) {
             const wanted = input.name.trim().toLowerCase()
             target = state.connections.find((entry) => entry.name.toLowerCase() === wanted) || null
           }
+          const incomingToken = typeof input.token === 'string' && input.token.length > 0 ? input.token : ''
           const merged = coerceConnection(
             {
               id: target ? target.id : undefined,
               name: typeof input.name === 'string' && input.name.trim() ? input.name : target ? target.name : '',
               baseUrl: typeof input.baseUrl === 'string' ? input.baseUrl : target ? target.baseUrl : '',
               username: typeof input.username === 'string' ? input.username : target ? target.username : '',
-              token: typeof input.token === 'string' && input.token.length > 0 ? input.token : target ? target.token : '',
+              token: '',
               insecureTls: typeof input.insecureTls === 'boolean' ? input.insecureTls : target ? target.insecureTls : true,
               jobFilter: typeof input.jobFilter === 'string' ? input.jobFilter : target ? target.jobFilter : '',
             },
             target ? target.name : `连接 ${state.connections.length + 1}`,
           )
+          if (incomingToken) {
+            // Tokens live in the DSH credential service; the settings file is
+            // only a fallback for environments where the service is not mounted.
+            if (await storeToken(store, merged.id, incomingToken)) merged.hasStoredToken = true
+            else merged.token = incomingToken
+          } else if (target) {
+            merged.token = target.token
+          }
           merged.baseUrl = normalizeBaseUrl(merged.baseUrl)
           if (target) {
             state.connections = state.connections.map((entry) => (entry.id === target.id ? merged : entry))
@@ -1455,7 +1577,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = resolveConnection(store.state, args && args.connection)
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
           const jobs = await createJenkins(connection).listJobs()
           return { ok: true, connection: publicConnection(connection), count: jobs.length, jobs: jobs.map(describeJob) }
         },
@@ -1470,7 +1592,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = resolveConnection(store.state, args && args.connection)
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
           const items = await createJenkins(connection).listQueue()
           return { ok: true, connection: publicConnection(connection), count: items.length, items }
         },
@@ -1490,7 +1612,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = resolveConnection(store.state, args && args.connection)
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
           const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
           const builds = await jenkins.listBuilds(job.url, args && args.limit)
@@ -1518,7 +1640,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args, exec) {
-          const connection = resolveConnection(store.state, args && args.connection)
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
           const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
           const previousNumber = job.lastBuild && typeof job.lastBuild.number === 'number' ? job.lastBuild.number : 0
@@ -1564,7 +1686,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = resolveConnection(store.state, args && args.connection)
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
           const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
           const lines = Math.min(Math.max(Number(args && args.lines) || analysisOf(store.state).logTailLines, 20), 1000)

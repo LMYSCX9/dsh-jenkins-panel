@@ -9,7 +9,7 @@ DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来�
 面板（左侧栏 → 齿轮图标，排在 Plugins / Schedules 之后）：
 
 - **多连接**：可配置多个 Jenkins 服务器（例如「公司机房」「测试环境」），面板顶部下拉切换、可新增与删除；新建的连接自动成为当前连接。面板和所有工具默认按「当前连接」工作，也可以按名字或 id 指定某一个连接。
-- **连接设置**：名称、地址、用户名、API Token、是否信任自签名证书、任务过滤；「保存并连接」会保存 → 测通 → 拉列表，失败直接回显原因。
+- **连接设置**：名称、地址、用户名、API Token、是否信任自签名证书、任务过滤；「保存并连接」会保存 → 测通 → 拉列表，失败直接回显原因。Token 存在 **DSH 凭据服务**（`~/.dsh/.credentials.yaml`）里，不写进插件设置文件。
 - **任务列表**：递归展开文件夹，显示为 `folder/job`；状态点、上次构建号、结果、相对时间、耗时；支持搜索。
 - **触发构建**：每行「构建」按钮，自动获取 CSRF crumb，返回 Jenkins 队列地址；提交后 4 秒自动刷新。参数化任务**按各参数的默认值构建**——先读 `parameterDefinitions`，只提交有默认值的参数，不需要填表。
 - **失败自动分析**（默认开启，面板可关）：由**对话里的 Agent 工具**触发的构建失败时，插件在后台等待构建结束，把控制台日志尾部回推给触发它的那个会话，由会话内 AI 输出结构化失败总结（结论 / 关键报错 / 可能原因 / 修复建议）。会话空闲时唤醒，正在运行时静默注入。面板按钮触发的构建不回推（没有触发会话）。
@@ -34,7 +34,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ## 更新
 
-面板标题下方有 `v1.4.11 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
+面板标题下方有 `v1.4.12 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
 
 - **npm 安装**：会向已配置的 registry 查询本插件的最新版本；发现更新时出现「更新到 x.y.z」，点一下就由 DSH 插件管理器完成安装（与 `install_plugin` 同一条 pnpm 路径），并提示是否需要重启 DSH；
 - **本地目录安装**：不自动更新，会直接说明原因（改源码后重新安装即可）；
@@ -48,7 +48,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ```text
 # npm
-dsh-jenkins-panel@1.4.11
+dsh-jenkins-panel@1.4.12
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
@@ -74,9 +74,11 @@ git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>
 
 保存位置：`~/.dsh/jenkins/settings.json`（权限 `0600`），可用环境变量 `DSH_JENKINS_SETTINGS` 覆盖路径。文件结构是 `{ version: 2, activeId, connections: [...] }`；旧版的单连接文件会在启动时自动迁移成一条连接。凭据不进 `cordis.patch.yml`。
 
+**API Token 存在 DSH 凭据服务**（`ctx.credentials`，即 `~/.dsh/.credentials.yaml`）里，按连接以 `DSH_JENKINS_TOKEN_<连接ID>` 为名引用；插件启动时会自动把设置文件里遗留的 token 迁移过去。凭据服务不可用时回退为原来的设置文件存储。
+
 ## 安全边界
 
-- Token **只写不读**：任何接口只返回 `hasToken: true/false`，不回显内容，也不进会话上下文。
+- Token **只写不读**：任何接口只返回 `hasToken: true/false`，不回显内容，也不进会话上下文。Token 存于 DSH 凭据服务（`~/.dsh/.credentials.yaml`，权限 `0600`），不进插件设置文件。
 - `/dsh-jenkins` 路由**只接受本机（loopback）请求**，非本机来源直接 403。
 - 请求特性：`insecureTls` 打开时接受自签名证书，适用于内网 Jenkins；关闭时按 Node 默认策略校验证书。
 
