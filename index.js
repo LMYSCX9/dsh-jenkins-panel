@@ -799,9 +799,13 @@ async function checkForUpdate(manager) {
     return { ...base, supported: false, target, source, reason: '插件管理器不支持版本查询' }
   }
 
+  // The recorded install target is usually pinned (name@1.4.3); inspecting it
+  // only ever resolves that exact version. Ask the registry for the latest
+  // version of this package instead.
+  const latestSpec = `${SELF.name}@latest`
   let inspection
   try {
-    inspection = await manager.inspect(target)
+    inspection = await manager.inspect(latestSpec)
   } catch (error) {
     return { ...base, supported: true, target, source, reason: `检查更新失败：${errorMessage(error)}` }
   }
@@ -812,7 +816,7 @@ async function checkForUpdate(manager) {
   return {
     ...base,
     supported: true,
-    target,
+    target: latestVersion ? `${SELF.name}@${latestVersion}` : latestSpec,
     source,
     latestVersion,
     updateAvailable: latestVersion ? compareVersions(latestVersion, SELF.version) > 0 : false,
