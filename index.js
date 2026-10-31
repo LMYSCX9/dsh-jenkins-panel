@@ -665,13 +665,32 @@ function isLocalSpec(target) {
   )
 }
 
-/** Extract a fetchable git remote from a spec or a bundle `source` string. */
-function gitRemoteOf(value) {
+/** Strip a `git+` prefix and any `#ref` suffix. */
+function gitSpecBase(value) {
   const text = String(value === undefined || value === null ? '' : value).trim()
   if (!text) return ''
   const withoutPrefix = text.replace(/^git\+/, '')
   const hashIndex = withoutPrefix.indexOf('#')
-  const base = hashIndex >= 0 ? withoutPrefix.slice(0, hashIndex) : withoutPrefix
+  return hashIndex >= 0 ? withoutPrefix.slice(0, hashIndex) : withoutPrefix
+}
+
+const GIT_SHORTHAND_HOSTS = {
+  github: 'github.com',
+  gitlab: 'gitlab.com',
+  bitbucket: 'bitbucket.org',
+  gitee: 'gitee.com',
+  gitea: 'gitea.com',
+}
+
+/** Extract a fetchable git remote from a spec or a bundle `source` string. */
+function gitRemoteOf(value) {
+  const base = gitSpecBase(value)
+  if (!base) return ''
+  const shorthand = /^(github|gitlab|bitbucket|gitee|gitea):([^/\s]+)\/([^/\s#]+)$/i.exec(base)
+  if (shorthand) {
+    const host = GIT_SHORTHAND_HOSTS[shorthand[1].toLowerCase()]
+    return `https://${host}/${shorthand[2]}/${shorthand[3].replace(/\.git$/i, '')}.git`
+  }
   const looksRemote =
     /^https?:\/\//i.test(base) ||
     /^(ssh|git):\/\//i.test(base) ||
@@ -685,6 +704,20 @@ function gitRemoteOf(value) {
   return base.replace(/\/+$/, '')
 }
 
+/** Whether a bundle `source` looks like it came from git at all. */
+function looksLikeGitSource(value) {
+  const text = String(value === undefined || value === null ? '' : value).trim()
+  if (!text) return false
+  const base = gitSpecBase(text)
+  return (
+    /^git\+/i.test(text) ||
+    /\.git$/i.test(base) ||
+    /^(github|gitlab|bitbucket|gitee|gitea):/i.test(base) ||
+    /^https?:\/\/(github|gitlab|bitbucket|gitee|gitea)\./i.test(base) ||
+    /^[\w.-]+@[\w.-]+:/.test(base)
+  )
+}
+
 /**
  * A git install has no registry version, so update means "the tip of the default branch".
  * The usual default branch names are tried in order; the first that resolves wins.
@@ -694,8 +727,9 @@ async function checkGitUpdate(manager, remote, base) {
     return { ...base, supported: false, source: remote, reason: '插件管理器不支持版本查询' }
   }
   let lastReason = ''
+  const needsPrefix = /^https?:\/\//i.test(remote) || /^(ssh|git):\/\//i.test(remote)
   for (const ref of ['main', 'master']) {
-    const spec = `git+${remote}#${ref}`
+    const spec = `${needsPrefix ? 'git+' : ''}${remote}#${ref}`
     let inspection
     try {
       inspection = await manager.inspect(spec)
@@ -757,6 +791,8 @@ async function checkForUpdate(manager) {
   // A git install may not report an installTarget at all; its `source` carries the remote.
   const gitRemote = gitRemoteOf(target) || gitRemoteOf(source)
   if (gitRemote) return checkGitUpdate(manager, gitRemote, base)
+  // Unrecognised git shorthand: hand the manager's own source string back to it.
+  if (looksLikeGitSource(source)) return checkGitUpdate(manager, gitSpecBase(source), base)
 
   if (!target) return { ...base, supported: false, source, reason: `没有可用的安装来源，无法自更新（来源：${source || '未知'}）` }
   if (typeof manager.inspect !== 'function') {
