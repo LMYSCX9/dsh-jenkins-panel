@@ -78,6 +78,8 @@ window.__ModuleLoader__.load({
         buildQueuedAt: '构建已进入队列',
         testOk: '连接成功',
         saved: '设置已保存',
+        analysis: '失败自动分析',
+        analysisDesc: '构建失败时，自动把日志尾部回推给触发构建的对话，由 AI 排查原因',
         loading: '加载中…',
         success: '成功',
         failure: '失败',
@@ -155,6 +157,8 @@ window.__ModuleLoader__.load({
         buildQueuedAt: 'Build queued',
         testOk: 'Connection succeeded',
         saved: 'Settings saved',
+        analysis: 'Failure auto-analysis',
+        analysisDesc: 'When a build fails, push the log tail back into the conversation that triggered it for AI analysis',
         loading: 'Loading…',
         success: 'Success',
         failure: 'Failure',
@@ -453,6 +457,7 @@ window.__ModuleLoader__.load({
       const [builds, setBuilds] = useState({})
       const [busyJob, setBusyJob] = useState('')
       const [updateInfo, setUpdateInfo] = useState(null)
+      const [analysisEnabled, setAnalysisEnabled] = useState(true)
       const timerRef = useRef(null)
 
       const settings = useMemo(
@@ -526,13 +531,29 @@ window.__ModuleLoader__.load({
       const bootstrap = useCallback(async () => {
         setLoading(true)
         try {
-          applyState(await callApi('/state'))
+          const state = await callApi('/state')
+          applyState(state)
+          if (state && typeof state.analysis === 'object' && state.analysis) {
+            setAnalysisEnabled(state.analysis.enabled !== false)
+          }
         } catch (error) {
           setBanner({ kind: 'error', text: error.message })
         } finally {
           setLoading(false)
         }
       }, [applyState])
+
+      const toggleAnalysis = useCallback(async (enabled) => {
+        setAnalysisEnabled(enabled)
+        try {
+          const result = await callApi('/analysis', { enabled })
+          if (!result.ok) throw new Error(result.error || '保存失败')
+          if (result.analysis && typeof result.analysis === 'object') setAnalysisEnabled(result.analysis.enabled !== false)
+        } catch (error) {
+          setAnalysisEnabled(!enabled)
+          setBanner({ kind: 'error', text: error.message })
+        }
+      }, [])
 
       const checkUpdate = useCallback(async (silent) => {
         if (!silent) setBusy('update')
@@ -954,6 +975,17 @@ window.__ModuleLoader__.load({
                   h('p', { className: 'djl-hint' }, `${t('settingsPath')} ${settingsFile || ''}`),
                 )
               : null,
+          ),
+
+          h(
+            'label',
+            { className: 'djl-check', title: t('analysisDesc') },
+            h('input', {
+              type: 'checkbox',
+              checked: analysisEnabled,
+              onChange: (event) => void toggleAnalysis(event.target.checked),
+            }),
+            h('span', null, `${t('analysis')} — ${t('analysisDesc')}`),
           ),
 
           h(

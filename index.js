@@ -7,6 +7,7 @@
  *
  * No runtime dependency: Node built-ins only.
  */
+import { randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -99,13 +100,14 @@ function loadState(config) {
     activeId = connections[0] ? connections[0].id : ''
   }
   if (!connections.some((entry) => entry.id === activeId)) activeId = connections[0] ? connections[0].id : ''
-  return { connections, activeId }
+  const analysis = stored && typeof stored.analysis === 'object' && stored.analysis ? stored.analysis : {}
+  return { connections, activeId, analysis }
 }
 
 function persistState(state) {
   const file = settingsFile()
   mkdirSync(path.dirname(file), { recursive: true })
-  const payload = { version: 2, activeId: state.activeId, connections: state.connections }
+  const payload = { version: 2, activeId: state.activeId, connections: state.connections, analysis: state.analysis || {} }
   writeFileSync(file, `${JSON.stringify(payload, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
   try {
     chmodSync(file, 0o600)
@@ -132,6 +134,7 @@ function publicState(state) {
   return {
     activeId: state.activeId,
     connections: state.connections.map(publicConnection),
+    analysis: analysisPublic(state),
     settingsFile: settingsFile(),
   }
 }
@@ -561,6 +564,61 @@ function createJenkins(settings) {
     }
   }
 
+  async function jobLastBuild(jobUrl) {
+    const tree = 'lastBuild[number,building,result,url]'
+    const response = await call(`${ensureTrailingSlash(jobUrl)}api/json?tree=${encodeURIComponent(tree)}`)
+    if (response.status >= 400) return null
+    try {
+      const data = parseJson(response, '读取最近构建')
+      if (!data || typeof data !== 'object' || typeof data.url !== 'string' || !data.url) return null
+      return {
+        number: typeof data.number === 'number' ? data.number : null,
+        building: data.building === true,
+        result: typeof data.result === 'string' ? data.result : null,
+        url: data.url,
+      }
+    } catch {
+      return null
+    }
+  }
+
+  async function readBuild(buildUrl) {
+    const tree = 'number,building,result,duration,url'
+    const response = await call(`${ensureTrailingSlash(buildUrl)}api/json?tree=${encodeURIComponent(tree)}`)
+    ensureOk(response, '读取构建状态')
+    const data = parseJson(response, '读取构建状态')
+    return {
+      number: typeof data.number === 'number' ? data.number : null,
+      building: data.building === true,
+      result: typeof data.result === 'string' ? data.result : null,
+      duration: typeof data.duration === 'number' ? data.duration : 0,
+      url: typeof data.url === 'string' && data.url ? data.url : buildUrl,
+    }
+  }
+
+  async function readConsoleText(buildUrl) {
+    const response = await call(`${ensureTrailingSlash(buildUrl)}consoleText`, { accept: 'text/plain, */*' })
+    ensureOk(response, '读取构建日志')
+    return response.text || ''
+  }
+
+  /** Resolve a queue item to its executable build once Jenkins has scheduled it. */
+  async function queueItem(queueUrl) {
+    const response = await call(`${ensureTrailingSlash(queueUrl)}api/json?tree=${encodeURIComponent('executable[number,url]')}`)
+    if (response.status >= 400) return null
+    try {
+      const data = parseJson(response, '读取队列项')
+      const executable = data && typeof data.executable === 'object' && data.executable ? data.executable : null
+      if (!executable || typeof executable.url !== 'string' || !executable.url) return null
+      return {
+        number: typeof executable.number === 'number' ? executable.number : null,
+        url: executable.url,
+      }
+    } catch {
+      return null
+    }
+  }
+
   async function testConnection() {
     const started = Date.now()
     const response = await call('api/json?tree=mode,nodeDescription,useSecurity')
@@ -592,7 +650,7 @@ function createJenkins(settings) {
     }
   }
 
-  return { baseUrl, listJobs, listBuilds, listQueue, triggerBuild, testConnection }
+  return { baseUrl, listJobs, listBuilds, listQueue, triggerBuild, testConnection, jobLastBuild, readBuild, readConsoleText, queueItem }
 }
 
 function resolveJob(jobs, wanted) {
@@ -607,6 +665,187 @@ function resolveJob(jobs, wanted) {
   if (fuzzy.length === 1) return fuzzy[0]
   if (fuzzy.length === 0) throw new Error(`没有找到匹配的任务：${needle}`)
   throw new Error(`「${needle}」匹配到多个任务：${fuzzy.slice(0, 6).map((job) => job.name).join('、')}`)
+}
+
+/* --------------------------------------------------------- failure analysis */
+
+const ANALYSIS_SOURCE_KIND = 'dsh-jenkins-panel'
+
+/** Normalized failure-analysis settings; every field is optional and bounded. */
+function analysisOf(state) {
+  const raw = state.analysis && typeof state.analysis === 'object' ? state.analysis : {}
+  return {
+    enabled: raw.enabled !== false,
+    logTailLines: Math.min(Math.max(Number(raw.logTailLines) || 200, 20), 1000),
+    maxWaitMs: Math.min(Math.max(Number(raw.maxWaitMs) || 30 * 60 * 1000, 60 * 1000), 24 * 60 * 60 * 1000),
+  }
+}
+
+function analysisPublic(state) {
+  const analysis = analysisOf(state)
+  return { enabled: analysis.enabled, logTailLines: analysis.logTailLines }
+}
+
+/** Last `limit` lines of a console log. */
+function consoleTail(text, limit) {
+  const lines = String(text || '').split(/\r?\n/)
+  return lines.slice(Math.max(0, lines.length - limit)).join('\n')
+}
+
+function analysisPrompt(info) {
+  const lines = ['【Jenkins 失败自动分析】']
+  if (info.connectionName) lines.push(`连接：${info.connectionName}`)
+  lines.push(`任务：${info.jobName}`, `构建：#${info.number}`, `结果：${info.result}`)
+  if (info.duration > 0) lines.push(`耗时：${Math.round(info.duration / 1000)} 秒`)
+  if (info.url) lines.push(`地址：${info.url}`)
+  lines.push(
+    '',
+    '控制台日志尾部：',
+    '',
+    '```text',
+    info.consoleTail || '（日志为空或读取失败）',
+    '```',
+    '',
+    '请基于以上日志做只读排查，不要重新触发构建，输出结构化失败总结：',
+    '1. 结论（一句话）；2. 关键报错（摘录原文）；3. 可能原因；4. 修复建议。',
+  )
+  return lines.join('\n')
+}
+
+function analysisSummary(info) {
+  const text = `Jenkins 构建 ${info.jobName} #${info.number} 失败，已附日志尾部供分析`
+  return text.length > 120 ? `${text.slice(0, 117)}...` : text
+}
+
+/**
+ * Hand a message to the agent that owns `sessionId`, following the official
+ * delivery pattern: wake an idle agent with followup(), otherwise inject the
+ * message into the running loop without interrupting it. The message object is
+ * built by hand (id/role/content/source) because plugin code cannot import the
+ * host's message factory.
+ */
+function deliverAnalysis(ctx, sessionId, text, summary) {
+  const agents = typeof ctx.get === 'function' ? ctx.get('agents') : null
+  const agent = agents && typeof agents.get === 'function' ? agents.get(sessionId) : null
+  if (!agent || typeof agent.followup !== 'function') return false
+  const message = {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: ANALYSIS_SOURCE_KIND, form: 'notice', summary },
+  }
+  try {
+    if (agent.status === 'idle') agent.followup(message)
+    else agent.inject(message)
+  } catch (error) {
+    warn(`回推失败分析失败：${errorMessage(error)}`)
+    return false
+  }
+  return true
+}
+
+/**
+ * Poll the queue (then the build) until it finishes; on FAILURE push the log
+ * tail back into the triggering session. Bounded by analysis.maxWaitMs.
+ */
+function startFailureWatcher(ctx, watchers, options) {
+  const analysis = options.analysis
+  if (!analysis.enabled || !options.sessionId) return
+  const connection = options.connection
+  const deadline = Date.now() + analysis.maxWaitMs
+  let buildUrl = ''
+  let buildNumber = options.previousNumber || 0
+  let timer = null
+
+  const clear = () => {
+    if (timer) {
+      clearTimeout(timer)
+      timer = null
+    }
+    watchers.delete(clear)
+  }
+  watchers.add(clear)
+
+  const finishWith = async (jenkins, build) => {
+    clear()
+    if (build.result !== 'FAILURE') return
+    let tail = ''
+    try {
+      tail = consoleTail(await jenkins.readConsoleText(build.url || buildUrl), analysis.logTailLines)
+    } catch (error) {
+      tail = `（读取构建日志失败：${errorMessage(error)}）`
+    }
+    const info = {
+      connectionName: connection.name,
+      jobName: options.jobName,
+      number: build.number || buildNumber,
+      result: build.result,
+      duration: build.duration || 0,
+      url: build.url || buildUrl,
+      consoleTail: tail,
+    }
+    const delivered = deliverAnalysis(ctx, options.sessionId, analysisPrompt(info), analysisSummary(info))
+    if (!delivered) warn(`会话 ${options.sessionId} 不在线，已跳过失败分析回推`)
+  }
+
+  const schedule = (delay) => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      watchers.delete(clear)
+      return
+    }
+    timer = setTimeout(() => {
+      void tick()
+    }, Math.min(delay, remaining))
+  }
+
+  const tick = async () => {
+    timer = null
+    if (Date.now() >= deadline) {
+      watchers.delete(clear)
+      return
+    }
+    let jenkins = null
+    try {
+      jenkins = createJenkins(connection)
+    } catch {
+      schedule(15000)
+      return
+    }
+    try {
+      if (!buildUrl) {
+        if (options.queueUrl) {
+          const item = await jenkins.queueItem(options.queueUrl)
+          if (item && item.url) {
+            buildUrl = item.url
+            if (item.number) buildNumber = item.number
+          }
+        }
+        if (!buildUrl && options.jobUrl) {
+          // Fallback when Jenkins does not hand back a queue URL: wait for the
+          // job's last build to advance past the one seen before the trigger.
+          const last = await jenkins.jobLastBuild(options.jobUrl)
+          if (last && typeof last.number === 'number' && last.number > buildNumber && last.url) {
+            buildUrl = last.url
+            buildNumber = last.number
+          }
+        }
+      }
+      if (buildUrl) {
+        const build = await jenkins.readBuild(buildUrl)
+        if (build.number) buildNumber = build.number
+        if (!build.building && build.result) {
+          await finishWith(jenkins, build)
+          return
+        }
+      }
+    } catch (error) {
+      warn(`等待构建结果失败（继续重试）：${errorMessage(error)}`)
+    }
+    schedule(8000)
+  }
+
+  schedule(5000)
 }
 
 /* -------------------------------------------------------------------- update */
@@ -998,6 +1237,20 @@ function createRouteHandler(store) {
         return
       }
 
+      // Toggle failure auto-analysis. Global (not per connection).
+      if (route === '/analysis' && req.method === 'POST') {
+        const raw = state.analysis && typeof state.analysis === 'object' ? state.analysis : {}
+        if (typeof body.enabled === 'boolean') raw.enabled = body.enabled
+        if (body.logTailLines !== undefined) {
+          const lines = Number(body.logTailLines)
+          if (Number.isFinite(lines)) raw.logTailLines = lines
+        }
+        state.analysis = raw
+        const file = persistState(state)
+        sendJson(res, 200, { ok: true, analysis: analysisPublic(state), savedTo: file })
+        return
+      }
+
       // Everything below works on one connection: the named one, else the active one.
       const connection = resolveConnection(state, reference)
 
@@ -1083,6 +1336,8 @@ export function apply(ctx, config) {
     manager: () => (typeof ctx.get === 'function' ? ctx.get('pluginManager') : null),
   }
   const handle = createRouteHandler(store)
+  // Clear callbacks of all in-flight build watchers (see startFailureWatcher).
+  const watchers = new Set()
 
   const connectionParam = {
     type: 'string',
@@ -1237,7 +1492,7 @@ export function apply(ctx, config) {
       {
         name: 'jenkins_build',
         description:
-          'Trigger a build of one Jenkins job and return the queue URL. For a parameterized job, omitting params builds with each parameter’s declared default value; pass params only when a non-default value is really required.',
+          'Trigger a build of one Jenkins job and return the queue URL. For a parameterized job, omitting params builds with each parameter’s declared default value; pass params only when a non-default value is really required. When the build ends with FAILURE, the plugin automatically pushes the console log tail back into this conversation for failure analysis.',
         parameters: {
           type: 'object',
           properties: {
@@ -1254,12 +1509,81 @@ export function apply(ctx, config) {
           additionalProperties: false,
         },
         output: textOutput,
+        async execute(args, exec) {
+          const connection = resolveConnection(store.state, args && args.connection)
+          const jenkins = createJenkins(connection)
+          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const previousNumber = job.lastBuild && typeof job.lastBuild.number === 'number' ? job.lastBuild.number : 0
+          const result = await jenkins.triggerBuild(job.url, args && args.params)
+          // Only agent-initiated builds get failure analysis: the analysis is
+          // pushed back into the conversation that triggered the build.
+          const session = exec && exec.agent ? exec.agent.session : null
+          const sessionId = typeof session === 'string' ? session : session && typeof session.id === 'string' ? session.id : ''
+          if (sessionId) {
+            startFailureWatcher(ctx, watchers, {
+              connection,
+              jobName: job.name,
+              jobUrl: job.url,
+              queueUrl: result.queueUrl,
+              previousNumber,
+              sessionId,
+              analysis: analysisOf(store.state),
+            })
+          }
+          return {
+            ok: true,
+            connection: publicConnection(connection),
+            job: { name: job.name, url: job.url },
+            ...result,
+            ...(sessionId ? { failureAnalysis: 'watching' } : {}),
+          }
+        },
+      },
+      {
+        name: 'jenkins_analyze_build',
+        description:
+          'Fetch the result and the tail of the console log of one Jenkins build so the caller can analyse it. Defaults to the most recent completed build of the job.',
+        parameters: {
+          type: 'object',
+          properties: {
+            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to use the last completed build.' },
+            lines: { type: 'integer', minimum: 20, maximum: 1000, description: 'How many trailing log lines to return. Defaults to 200.' },
+            connection: connectionParam,
+          },
+          required: ['job'],
+          additionalProperties: false,
+        },
+        output: textOutput,
         async execute(args) {
           const connection = resolveConnection(store.state, args && args.connection)
           const jenkins = createJenkins(connection)
           const job = resolveJob(await jenkins.listJobs(), args && args.job)
-          const result = await jenkins.triggerBuild(job.url, args && args.params)
-          return { ok: true, connection: publicConnection(connection), job: { name: job.name, url: job.url }, ...result }
+          const lines = Math.min(Math.max(Number(args && args.lines) || analysisOf(store.state).logTailLines, 20), 1000)
+          let buildUrl = ''
+          const wanted = args && typeof args.build === 'number' ? args.build : null
+          if (wanted) {
+            buildUrl = `${ensureTrailingSlash(job.url)}${wanted}/`
+          } else {
+            const builds = await jenkins.listBuilds(job.url, 1)
+            const last = builds.find((entry) => !entry.building && entry.result) || builds[0]
+            if (!last) throw new Error(`任务 ${job.name} 还没有任何构建`)
+            buildUrl = last.url
+          }
+          const build = await jenkins.readBuild(buildUrl)
+          let tail = ''
+          try {
+            tail = consoleTail(await jenkins.readConsoleText(build.url || buildUrl), lines)
+          } catch {
+            tail = ''
+          }
+          return {
+            ok: true,
+            connection: publicConnection(connection),
+            job: { name: job.name, url: job.url },
+            build: { number: build.number, result: build.result, building: build.building, duration: build.duration, url: build.url || buildUrl },
+            consoleTail: tail,
+          }
         },
       },
     ]
