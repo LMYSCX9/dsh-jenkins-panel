@@ -685,7 +685,13 @@ async function checkForUpdate(manager) {
 
   const target = entry.installTarget && typeof entry.installTarget.spec === 'string' ? entry.installTarget.spec : ''
   const source = typeof entry.source === 'string' ? entry.source : ''
-  if (!target) return { ...base, supported: false, source, reason: '没有可用的安装来源，无法自更新' }
+  if (!target) {
+    const sourcePath = source.replace(/^(link|file|path):/i, '')
+    if (/^(link|file|path):/i.test(source) || isLocalSpec(sourcePath)) {
+      return { ...base, supported: false, source, reason: '当前是本地目录安装：改源码后重新安装即可，不通过市场更新' }
+    }
+    return { ...base, supported: false, source, reason: '没有可用的安装来源，无法自更新' }
+  }
   if (isLocalSpec(target)) {
     return { ...base, supported: false, target, source, reason: '当前是本地目录安装：改源码后重新安装即可，不通过市场更新' }
   }
