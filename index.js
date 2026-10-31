@@ -742,6 +742,15 @@ async function checkGitUpdate(manager, remote, base) {
       continue
     }
     const latestVersion = typeof inspection.version === 'string' ? inspection.version : ''
+    if (!latestVersion) {
+      return {
+        ...base,
+        supported: false,
+        kind: 'git',
+        source: remote,
+        reason: `git 安装：已解析 ${ref} 分支，但插件管理器未返回版本号，无法比较（可能是 DSH 版本过旧，inspect 不解析 git 包的 version，请升级 DSH 后重试）`,
+      }
+    }
     return {
       ...base,
       supported: true,
@@ -750,7 +759,7 @@ async function checkGitUpdate(manager, remote, base) {
       source: remote,
       ref,
       latestVersion,
-      updateAvailable: latestVersion ? compareVersions(latestVersion, SELF.version) > 0 : false,
+      updateAvailable: compareVersions(latestVersion, SELF.version) > 0,
     }
   }
   return {
