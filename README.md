@@ -1,6 +1,6 @@
 # dsh-jenkins
 
-DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来连接 Jenkins、查询任务、触发构建、查看队列；同样的能力同时以 7 个 Agent 工具暴露给模型。支持同时配置多个 Jenkins 服务器。
+DSH（DeepSeek Harness）的 Jenkins 插件：左侧栏入口 + 面板，用来连接 Jenkins、查询任务、触发构建、查看队列；同样的能力同时以 11 个 Agent 工具暴露给模型。支持同时配置多个 Jenkins 服务器。
 
 零运行时依赖（只用 Node 内置模块），纯 ESM，无构建步骤。
 
@@ -26,6 +26,10 @@ Agent 工具（与面板共用同一套 Host 代码）：
 | `jenkins_build` | 触发构建；参数化任务按声明默认值构建，可用 `params` 覆盖；失败时自动把日志尾部回推到当前会话 |
 | `jenkins_builds` | 查看某任务最近若干次构建 |
 | `jenkins_analyze_build` | 取某次构建的结果与控制台日志尾部（默认最近一次已完成的构建），供模型只读分析 |
+| `jenkins_build_cancel` | 中止进行中的构建（默认当前在跑的那次；已结束则返回 `stopped: false`） |
+| `jenkins_build_artifacts` | 列出某次构建的产物（文件名 / 相对路径 / 下载地址；默认最近一次已完成的构建） |
+| `jenkins_view_list` | 列出服务器的 Jenkins 视图（任务列表上方的页签） |
+| `jenkins_view_jobs` | 按视图列任务（视图名精确 → 模糊解析；省略时用默认 `all` 视图） |
 | `jenkins_queue` | 查看构建队列 |
 
 除 `jenkins_connections` / `jenkins_configure` 外，其余工具都接受可选的 `connection` 参数（连接 id 或名称），省略时使用当前连接。
@@ -34,7 +38,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ## 更新
 
-面板标题下方有 `v1.4.13 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
+面板标题下方有 `v1.4.14 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
 
 - **npm 安装**：会向已配置的 registry 查询本插件的最新版本；发现更新时出现「更新到 x.y.z」，点一下就由 DSH 插件管理器完成安装（与 `install_plugin` 同一条 pnpm 路径），并提示是否需要重启 DSH；
 - **本地目录安装**：不自动更新，会直接说明原因（改源码后重新安装即可）；
@@ -48,7 +52,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ```text
 # npm
-dsh-jenkins-panel@1.4.12
+dsh-jenkins-panel@1.4.14
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>

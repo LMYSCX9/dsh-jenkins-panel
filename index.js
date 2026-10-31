@@ -716,6 +716,64 @@ function createJenkins(settings) {
     }
   }
 
+  async function listViews() {
+    const tree = 'views[name,url]'
+    const response = await call(`api/json?tree=${encodeURIComponent(tree)}`)
+    ensureOk(response, '读取视图列表')
+    const data = parseJson(response, '读取视图列表')
+    const views = Array.isArray(data.views) ? data.views : []
+    return views
+      .filter((view) => view && typeof view.name === 'string' && typeof view.url === 'string')
+      .map((view) => ({ name: view.name, url: view.url }))
+  }
+
+  async function listJobsInView(viewUrl) {
+    const tree = 'jobs[name,color,url,_class,lastBuild[number,result,building,timestamp,duration,url]]'
+    const response = await call(`${ensureTrailingSlash(viewUrl)}api/json?tree=${encodeURIComponent(tree)}`)
+    ensureOk(response, '读取视图任务')
+    const data = parseJson(response, '读取视图任务')
+    const jobs = Array.isArray(data.jobs) ? data.jobs : []
+    return jobs
+      .filter((job) => job && typeof job.name === 'string')
+      .map((job) => mapJob(job, job.name))
+  }
+
+  async function listBuildArtifacts(buildUrl) {
+    const tree = 'number,result,building,artifacts[fileName,relativePath]'
+    const response = await call(`${ensureTrailingSlash(buildUrl)}api/json?tree=${encodeURIComponent(tree)}`)
+    ensureOk(response, '读取构建产物')
+    const data = parseJson(response, '读取构建产物')
+    const artifacts = Array.isArray(data.artifacts) ? data.artifacts : []
+    return {
+      number: typeof data.number === 'number' ? data.number : null,
+      result: typeof data.result === 'string' ? data.result : null,
+      building: data.building === true,
+      artifacts: artifacts
+        .filter((entry) => entry && typeof entry.relativePath === 'string')
+        .map((entry) => ({
+          fileName: typeof entry.fileName === 'string' ? entry.fileName : entry.relativePath,
+          relativePath: entry.relativePath,
+        })),
+    }
+  }
+
+  /** Abort a running build; resolves with stopped:false when it already finished. */
+  async function cancelBuild(buildUrl) {
+    const build = await readBuild(buildUrl)
+    if (!build.building) {
+      return { stopped: false, number: build.number, result: build.result, reason: '构建已经结束' }
+    }
+    const crumb = await readCrumb()
+    const response = await call(`${ensureTrailingSlash(buildUrl)}stop`, { method: 'POST', crumb, accept: 'text/plain, */*' })
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('中止构建失败：认证未通过或当前账号没有中止权限')
+    }
+    if (response.status >= 400) {
+      throw new Error(`中止构建失败：HTTP ${response.status}${snippet(response.text) ? `，${snippet(response.text)}` : ''}`)
+    }
+    return { stopped: true, number: build.number }
+  }
+
   async function testConnection() {
     const started = Date.now()
     const response = await call('api/json?tree=mode,nodeDescription,useSecurity')
@@ -747,7 +805,22 @@ function createJenkins(settings) {
     }
   }
 
-  return { baseUrl, listJobs, listBuilds, listQueue, triggerBuild, testConnection, jobLastBuild, readBuild, readConsoleText, queueItem }
+  return {
+    baseUrl,
+    listJobs,
+    listBuilds,
+    listQueue,
+    triggerBuild,
+    testConnection,
+    jobLastBuild,
+    readBuild,
+    readConsoleText,
+    queueItem,
+    listViews,
+    listJobsInView,
+    listBuildArtifacts,
+    cancelBuild,
+  }
 }
 
 function resolveJob(jobs, wanted) {
@@ -762,6 +835,18 @@ function resolveJob(jobs, wanted) {
   if (fuzzy.length === 1) return fuzzy[0]
   if (fuzzy.length === 0) throw new Error(`没有找到匹配的任务：${needle}`)
   throw new Error(`「${needle}」匹配到多个任务：${fuzzy.slice(0, 6).map((job) => job.name).join('、')}`)
+}
+
+/** Resolve a view by name; the empty reference means Jenkins's default "all" view. */
+function resolveView(views, wanted) {
+  const needle = String(wanted || 'all').trim().toLowerCase()
+  const exact = views.find((view) => view.name.toLowerCase() === needle)
+  if (exact) return exact
+  const fuzzy = views.filter((view) => view.name.toLowerCase().includes(needle))
+  if (fuzzy.length === 1) return fuzzy[0]
+  const names = views.map((view) => view.name).join('、') || '（服务器没有任何视图）'
+  if (fuzzy.length === 0) throw new Error(`没有找到匹配的视图：${needle}，现有视图：${names}`)
+  throw new Error(`「${needle}」匹配到多个视图：${fuzzy.slice(0, 6).map((view) => view.name).join('、')}`)
 }
 
 /* --------------------------------------------------------- failure analysis */
@@ -1785,6 +1870,115 @@ export function apply(ctx, config) {
             build: { number: build.number, result: build.result, building: build.building, duration: build.duration, url: build.url || buildUrl },
             consoleTail: tail,
           }
+        },
+      },
+      {
+        name: 'jenkins_build_cancel',
+        description:
+          'Abort a running Jenkins build. Defaults to the job’s current in-progress build; returns stopped:false when the build had already finished.',
+        parameters: {
+          type: 'object',
+          properties: {
+            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to abort the job’s current in-progress build.' },
+            connection: connectionParam,
+          },
+          required: ['job'],
+          additionalProperties: false,
+        },
+        output: textOutput,
+        async execute(args) {
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
+          const jenkins = createJenkins(connection)
+          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          let buildUrl = ''
+          const wanted = args && typeof args.build === 'number' ? args.build : null
+          if (wanted) {
+            buildUrl = `${ensureTrailingSlash(job.url)}${wanted}/`
+          } else {
+            const builds = await jenkins.listBuilds(job.url, 5)
+            const running = builds.find((entry) => entry.building)
+            if (!running || !running.url) throw new Error(`任务 ${job.name} 没有进行中的构建`)
+            buildUrl = running.url
+          }
+          const result = await jenkins.cancelBuild(buildUrl)
+          return { ok: true, connection: publicConnection(connection), job: { name: job.name, url: job.url }, buildUrl, ...result }
+        },
+      },
+      {
+        name: 'jenkins_build_artifacts',
+        description:
+          'List the artifacts of one Jenkins build with each file’s name, relative path, and download URL. Defaults to the last completed build.',
+        parameters: {
+          type: 'object',
+          properties: {
+            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to use the last completed build.' },
+            connection: connectionParam,
+          },
+          required: ['job'],
+          additionalProperties: false,
+        },
+        output: textOutput,
+        async execute(args) {
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
+          const jenkins = createJenkins(connection)
+          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          let buildUrl = ''
+          const wanted = args && typeof args.build === 'number' ? args.build : null
+          if (wanted) {
+            buildUrl = `${ensureTrailingSlash(job.url)}${wanted}/`
+          } else {
+            const builds = await jenkins.listBuilds(job.url, 1)
+            const last = builds.find((entry) => !entry.building && entry.result) || builds[0]
+            if (!last || !last.url) throw new Error(`任务 ${job.name} 还没有任何构建`)
+            buildUrl = last.url
+          }
+          const info = await jenkins.listBuildArtifacts(buildUrl)
+          return {
+            ok: true,
+            connection: publicConnection(connection),
+            job: { name: job.name, url: job.url },
+            build: { number: info.number, result: info.result, building: info.building, url: buildUrl },
+            count: info.artifacts.length,
+            artifacts: info.artifacts.map((entry) => ({ ...entry, url: `${ensureTrailingSlash(buildUrl)}artifact/${entry.relativePath}` })),
+          }
+        },
+      },
+      {
+        name: 'jenkins_view_list',
+        description: 'List the Jenkins views (the tabs above the job list) with their names and URLs.',
+        parameters: {
+          type: 'object',
+          properties: { connection: connectionParam },
+          additionalProperties: false,
+        },
+        output: textOutput,
+        async execute(args) {
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
+          const views = await createJenkins(connection).listViews()
+          return { ok: true, connection: publicConnection(connection), count: views.length, views }
+        },
+      },
+      {
+        name: 'jenkins_view_jobs',
+        description:
+          'List the jobs included in one Jenkins view, with each job’s last build state. The view name resolves exactly, then fuzzily; omit it to use the default "all" view.',
+        parameters: {
+          type: 'object',
+          properties: {
+            view: { type: 'string', description: 'View name. Omit it to use the default "all" view.' },
+            connection: connectionParam,
+          },
+          additionalProperties: false,
+        },
+        output: textOutput,
+        async execute(args) {
+          const connection = await resolveRuntimeConnection(store, args && args.connection)
+          const jenkins = createJenkins(connection)
+          const view = resolveView(await jenkins.listViews(), args && args.view)
+          const jobs = await jenkins.listJobsInView(view.url)
+          return { ok: true, connection: publicConnection(connection), view: view.name, count: jobs.length, jobs: jobs.map(describeJob) }
         },
       },
     ]
