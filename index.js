@@ -1171,6 +1171,10 @@ async function checkGitUpdate(remote, base) {
       `https://raw.githubusercontent.com/${owner}/${repo}/${ref}/package.json`,
       `https://api.github.com/repos/${owner}/${repo}/contents/package.json?ref=${ref}`,
       `https://cdn.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
+      // Alternate jsDelivr edges: cdn.jsdelivr.net is often unreachable from
+      // CN networks while the fastly/gcore edges still answer.
+      `https://fastly.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
+      `https://gcore.jsdelivr.net/gh/${owner}/${repo}@${ref}/package.json`,
     ]
     let best = null
     for (const url of urls) {
@@ -1186,7 +1190,11 @@ async function checkGitUpdate(remote, base) {
         }
         text = await response.text()
       } catch (error) {
-        problems.push(`${new URL(url).host} → ${errorMessage(error)}`)
+        // undici's fetch only says "fetch failed"; the reason (DNS, timeout,
+        // TLS) sits on error.cause — surface it so the failure is diagnosable.
+        const cause = error && error.cause
+        const detail = cause && typeof cause === 'object' ? cause.code || cause.message : ''
+        problems.push(`${new URL(url).host} → ${errorMessage(error)}${detail ? `（${detail}）` : ''}`)
         continue
       }
       let manifest
@@ -1231,7 +1239,7 @@ async function checkGitUpdate(remote, base) {
     ...base,
     supported: false,
     source: remote,
-    reason: `git 安装：无法读取远端版本${problems.length ? `（${problems.slice(0, 3).join('；')}）` : ''}`,
+    reason: `git 安装：无法读取远端版本${problems.length ? `（${problems.slice(0, 6).join('；')}）` : ''}`,
   }
 }
 
