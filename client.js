@@ -58,6 +58,7 @@ window.__ModuleLoader__.load({
         clearToken: '清除 Token',
         settingsPath: '连接配置保存在',
         jobs: '任务',
+        viewAll: '全部',
         queue: '构建队列',
         search: '搜索任务…',
         refresh: '刷新',
@@ -138,6 +139,7 @@ window.__ModuleLoader__.load({
         clearToken: 'Clear token',
         settingsPath: 'Connection settings are stored in',
         jobs: 'Jobs',
+        viewAll: 'All',
         queue: 'Build queue',
         search: 'Search jobs…',
         refresh: 'Refresh',
@@ -344,6 +346,13 @@ window.__ModuleLoader__.load({
 .djl-update-text { font-size: 11px; color: var(--dsw-alias-label-secondary);
   max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .djl-count { font-weight: 400; color: var(--dsw-alias-label-secondary); font-size: 12px; }
+.djl-views { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px 0; }
+.djl-view-tab { height: 24px; padding: 0 12px; border-radius: 999px; font-size: 12px; font-family: inherit;
+  cursor: pointer; border: 1px solid var(--dsw-alias-border-l1); background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  transition: border-color 120ms ease, color 120ms ease; }
+.djl-view-tab:hover { border-color: var(--dsw-alias-border-l2); color: var(--dsw-alias-label-primary); }
+.djl-view-active { border-color: var(--dsw-alias-brand-primary); color: var(--dsw-alias-brand-primary); }
 .djl-card-body { padding: 16px; }
 .djl-form { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
 .djl-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
@@ -460,6 +469,9 @@ window.__ModuleLoader__.load({
       const [search, setSearch] = useState('')
       const [expanded, setExpanded] = useState('')
       const [jobsOpen, setJobsOpen] = useState(true)
+      const [views, setViews] = useState([])
+      const [activeView, setActiveView] = useState('')
+      const [viewJobs, setViewJobs] = useState({})
       const [builds, setBuilds] = useState({})
       const [busyJob, setBusyJob] = useState('')
       const [updateInfo, setUpdateInfo] = useState(null)
@@ -513,6 +525,9 @@ window.__ModuleLoader__.load({
         setQueue([])
         setExpanded('')
         setBuilds({})
+        setViews([])
+        setActiveView('')
+        setViewJobs({})
         setBanner(null)
       }, [selectedId, connections])
 
@@ -533,6 +548,40 @@ window.__ModuleLoader__.load({
           /* the queue is secondary: keep the page usable when only it fails */
         }
       }, [])
+
+      const loadViewsFor = useCallback(async (connId) => {
+        if (!connId) return
+        try {
+          const result = await callApi('/views', { connection: connId })
+          if (result.ok && Array.isArray(result.views)) {
+            // "all" is Jenkins's built-in everything view — the 全部 tab covers it.
+            setViews(result.views.filter((view) => view && view.name && view.url && view.name !== 'all'))
+            return
+          }
+        } catch {
+          /* views are decoration: an empty tab strip is fine when they fail */
+        }
+        setViews([])
+      }, [])
+
+      const selectView = useCallback(
+        async (name) => {
+          setActiveView(name)
+          if (!name) return
+          const key = `${selectedId}|${name}`
+          if (viewJobs[key]) return
+          const view = views.find((entry) => entry.name === name)
+          if (!view) return
+          try {
+            const result = await callApi('/view/jobs', { connection: selectedId, viewUrl: view.url })
+            if (!result.ok) throw new Error(result.error || '读取视图任务失败')
+            setViewJobs((current) => ({ ...current, [key]: Array.isArray(result.jobs) ? result.jobs : [] }))
+          } catch (error) {
+            setBanner({ kind: 'error', text: error.message })
+          }
+        },
+        [selectedId, views, viewJobs],
+      )
 
       const bootstrap = useCallback(async () => {
         setLoading(true)
@@ -622,12 +671,15 @@ window.__ModuleLoader__.load({
           } catch (error) {
             if (!cancelled) setBanner({ kind: 'error', text: error.message })
           }
-          if (!cancelled) await loadQueueFor(selectedId)
+          if (!cancelled) {
+            await loadQueueFor(selectedId)
+            await loadViewsFor(selectedId)
+          }
         })()
         return () => {
           cancelled = true
         }
-      }, [selectedId, settings.configured, loadJobsFor, loadQueueFor])
+      }, [selectedId, settings.configured, loadJobsFor, loadQueueFor, loadViewsFor])
 
       const save = useCallback(async (event) => {
         if (event) event.preventDefault()
@@ -802,16 +854,59 @@ window.__ModuleLoader__.load({
         return jobs.filter((job) => job.name.toLowerCase().includes(needle))
       }, [jobs, search])
 
+      // A selected view narrows the list to the jobs the Jenkins view contains;
+      // null while the view's job set is still being fetched.
+      const viewRows = activeView ? viewJobs[`${selectedId}|${activeView}`] : undefined
+      const visible = useMemo(() => {
+        if (!activeView) return filtered
+        if (!Array.isArray(viewRows)) return null
+        const urls = new Set(viewRows.map((row) => row.url))
+        const names = new Set(viewRows.map((row) => row.name))
+        return filtered.filter((job) => urls.has(job.url) || names.has(job.name))
+      }, [filtered, activeView, viewRows])
+
+      const viewsRow =
+        views.length > 0
+          ? h(
+              'div',
+              { className: 'djl-views' },
+              h(
+                'button',
+                {
+                  className: `djl-view-tab${activeView === '' ? ' djl-view-active' : ''}`,
+                  type: 'button',
+                  onClick: () => void selectView(''),
+                },
+                t('viewAll'),
+              ),
+              views.map((view) =>
+                h(
+                  'button',
+                  {
+                    key: view.url,
+                    className: `djl-view-tab${activeView === view.name ? ' djl-view-active' : ''}`,
+                    type: 'button',
+                    title: view.name,
+                    onClick: () => void selectView(view.name),
+                  },
+                  view.name,
+                ),
+              ),
+            )
+          : null
+
       let jobsBody = null
       if (jobsOpen) {
         if (loading) jobsBody = h('div', { className: 'djl-empty' }, t('loading'))
         else if (!settings.configured) jobsBody = h('div', { className: 'djl-empty' }, t('emptyHint'))
-        else if (filtered.length === 0) jobsBody = h('div', { className: 'djl-empty' }, search ? t('noMatch') : t('empty'))
+        else if (visible === null) jobsBody = h('div', { className: 'djl-empty' }, t('loading'))
+        else if (visible.length === 0)
+          jobsBody = h('div', { className: 'djl-empty' }, search || activeView ? t('noMatch') : t('empty'))
         else
           jobsBody = h(
             'ul',
             { className: 'djl-list' },
-            filtered.map((job) => {
+            visible.map((job) => {
               const last = job.lastBuild
               const open = expanded === job.name
               const rows = builds[job.name]
@@ -1103,6 +1198,7 @@ window.__ModuleLoader__.load({
                 jobsOpen ? t('collapse') : t('expand'),
               ),
             ),
+            viewsRow,
             jobsBody,
           ),
 

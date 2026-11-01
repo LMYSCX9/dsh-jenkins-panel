@@ -1707,6 +1707,20 @@ function createRouteHandler(store) {
         return
       }
 
+      if (route === '/views' && req.method === 'POST') {
+        const views = await createJenkins(connection).listViews()
+        sendJson(res, 200, { ok: true, views })
+        return
+      }
+
+      if (route === '/view/jobs' && req.method === 'POST') {
+        const viewUrl = typeof body.viewUrl === 'string' ? body.viewUrl.trim() : ''
+        if (!/^https?:\/\//i.test(viewUrl)) throw new Error('缺少视图地址')
+        const jobs = await createJenkins(connection).listJobsInView(viewUrl)
+        sendJson(res, 200, { ok: true, jobs })
+        return
+      }
+
       if (route === '/build' && req.method === 'POST') {
         const jenkins = createJenkins(connection)
         let jobUrl = typeof body.url === 'string' ? body.url.trim() : ''
