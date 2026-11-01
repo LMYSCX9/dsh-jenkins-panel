@@ -32,13 +32,13 @@ Agent 工具（与面板共用同一套 Host 代码）：
 | `jenkins_view_jobs` | 按视图列任务（视图名精确 → 模糊解析；省略时用默认 `all` 视图） |
 | `jenkins_queue` | 查看构建队列 |
 
-除 `jenkins_connections` / `jenkins_configure` 外，其余工具都接受可选的 `connection` 参数（连接 id 或名称），省略时使用当前连接。
+除 `jenkins_connections` / `jenkins_configure` 外，其余工具都接受可选的 `connection` 参数（连接 id 或名称），省略时使用当前连接。`jenkins_build` / `jenkins_builds` / `jenkins_analyze_build` / `jenkins_build_cancel` / `jenkins_build_artifacts` 这五个带任务参数的工具例外：**省略 `connection` 时会在所有已配置的连接中并行查找任务**——唯一命中直接使用（结果中注明来源连接），多个连接命中则拒绝执行并列出候选，要求指定连接；不可达的连接跳过并注明。
 
 Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工具调用的是同一批函数，不存在两份实现。
 
 ## 更新
 
-面板标题下方有 `v1.4.17 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
+面板标题下方有 `v1.4.18 · 检查更新` 一行，插件可以自己检查并安装新版本，不依赖「插件管理」页面：
 
 - **npm 安装**：会向已配置的 registry 查询本插件的最新版本；发现更新时出现「更新到 x.y.z」，点一下就由 DSH 插件管理器完成安装（与 `install_plugin` 同一条 pnpm 路径），并提示是否需要重启 DSH；
 - **本地目录安装**：不自动更新，会直接说明原因（改源码后重新安装即可）；
@@ -52,7 +52,7 @@ Host 侧通过前缀路由 `/dsh-jenkins` 提供同样的操作，面板与工�
 
 ```text
 # npm
-dsh-jenkins-panel@1.4.17
+dsh-jenkins-panel@1.4.18
 
 # git（推荐钉 commit，不要用分支名）
 git+https://github.com/LMYSCX9/dsh-jenkins-panel.git#<commit-sha>

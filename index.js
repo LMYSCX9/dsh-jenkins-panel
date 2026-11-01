@@ -823,18 +823,88 @@ function createJenkins(settings) {
   }
 }
 
+/** Non-throwing job matcher: exact matches, else `/`-suffix matches, else substring matches; deduped. */
+function matchJobs(jobs, wanted) {
+  const needle = String(wanted || '').trim()
+  if (!needle) return []
+  const lowered = needle.toLowerCase()
+  const hits = []
+  const seen = new Set()
+  const push = (job) => {
+    if (job && job.name && !seen.has(job.name)) {
+      seen.add(job.name)
+      hits.push(job)
+    }
+  }
+  for (const job of jobs) if (String(job.name).toLowerCase() === lowered) push(job)
+  if (hits.length === 0) for (const job of jobs) if (String(job.name).toLowerCase().endsWith(`/${lowered}`)) push(job)
+  if (hits.length === 0) for (const job of jobs) if (String(job.name).toLowerCase().includes(lowered)) push(job)
+  return hits
+}
+
 function resolveJob(jobs, wanted) {
   const needle = String(wanted || '').trim()
   if (!needle) throw new Error('缺少任务名称')
-  const lowered = needle.toLowerCase()
-  const exact = jobs.find((job) => job.name.toLowerCase() === lowered)
-  if (exact) return exact
-  const tail = jobs.find((job) => job.name.toLowerCase().endsWith(`/${lowered}`))
-  if (tail) return tail
-  const fuzzy = jobs.filter((job) => job.name.toLowerCase().includes(lowered))
-  if (fuzzy.length === 1) return fuzzy[0]
-  if (fuzzy.length === 0) throw new Error(`没有找到匹配的任务：${needle}`)
-  throw new Error(`「${needle}」匹配到多个任务：${fuzzy.slice(0, 6).map((job) => job.name).join('、')}`)
+  const hits = matchJobs(jobs, needle)
+  if (hits.length === 1) return hits[0]
+  if (hits.length === 0) throw new Error(`没有找到匹配的任务：${needle}`)
+  throw new Error(`「${needle}」匹配到多个任务：${hits.slice(0, 6).map((job) => job.name).join('、')}`)
+}
+
+/**
+ * Resolve one job for a tool call. With an explicit `connection` reference the
+ * search stays on that connection (the caller named it); without one, every
+ * configured connection is queried in parallel and the job is looked up in
+ * each result set. A unique hit across all connections is used directly (its
+ * connection is part of the result); multiple hits refuse to guess and list
+ * the candidates instead.
+ */
+async function resolveJobEverywhere(store, reference, wanted) {
+  const ref = typeof reference === 'string' && reference.trim() ? reference.trim() : ''
+  if (ref) {
+    const connection = await resolveRuntimeConnection(store, ref)
+    const jenkins = createJenkins(connection)
+    const job = resolveJob(await jenkins.listJobs(), wanted)
+    return { connection, jenkins, job }
+  }
+  const needle = String(wanted || '').trim()
+  if (!needle) throw new Error('缺少任务名称')
+  const connections = store.state.connections.filter((entry) => entry.baseUrl)
+  if (connections.length === 0) {
+    // No queryable connection: let resolveConnection produce its usual error.
+    const connection = await resolveRuntimeConnection(store, '')
+    const jenkins = createJenkins(connection)
+    const job = resolveJob(await jenkins.listJobs(), wanted)
+    return { connection, jenkins, job }
+  }
+  const settled = await Promise.allSettled(
+    connections.map(async (entry) => {
+      const connection = await resolveRuntimeConnection(store, entry.id)
+      const jobs = await createJenkins(connection).listJobs()
+      return { connection, jobs }
+    }),
+  )
+  const failures = []
+  const found = []
+  settled.forEach((result, index) => {
+    if (result.status === 'rejected') {
+      failures.push(`${connections[index].name} → ${errorMessage(result.reason)}`)
+      return
+    }
+    const { connection, jobs } = result.value
+    for (const job of matchJobs(jobs, needle)) found.push({ connection, job })
+  })
+  if (found.length === 1) {
+    const hit = found[0]
+    return { connection: hit.connection, jenkins: createJenkins(hit.connection), job: hit.job }
+  }
+  const names = connections.map((entry) => entry.name).join('、')
+  if (found.length === 0) {
+    const detail = failures.length ? `；不可达：${failures.join('；')}` : ''
+    throw new Error(`在所有连接（${names}）中都没有找到匹配的任务：${needle}${detail}`)
+  }
+  const candidates = found.map((hit) => `${hit.connection.name} 上的 ${hit.job.name}`).join('、')
+  throw new Error(`任务「${needle}」在多个连接中匹配到：${candidates}；请用 connection 参数指定连接`)
 }
 
 /** Resolve a view by name; the empty reference means Jenkins's default "all" view. */
@@ -1832,7 +1902,11 @@ export function apply(ctx, config) {
         parameters: {
           type: 'object',
           properties: {
-            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            job: {
+              type: 'string',
+              description:
+                'Job name, folder path such as folder/job, or a trailing part of the name. When `connection` is omitted the job is looked up across ALL configured connections in parallel: a unique match is used directly, multiple matches refuse to guess and list candidates.',
+            },
             limit: { type: 'integer', minimum: 1, maximum: 25, description: 'How many builds to return. Defaults to 8.' },
             connection: connectionParam,
           },
@@ -1841,9 +1915,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = await resolveRuntimeConnection(store, args && args.connection)
-          const jenkins = createJenkins(connection)
-          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const { connection, jenkins, job } = await resolveJobEverywhere(store, args && args.connection, args && args.job)
           const builds = await jenkins.listBuilds(job.url, args && args.limit)
           return { ok: true, connection: publicConnection(connection), job: { name: job.name, url: job.url }, builds }
         },
@@ -1855,7 +1927,11 @@ export function apply(ctx, config) {
         parameters: {
           type: 'object',
           properties: {
-            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            job: {
+              type: 'string',
+              description:
+                'Job name, folder path such as folder/job, or a trailing part of the name. When `connection` is omitted the job is looked up across ALL configured connections in parallel: a unique match is used directly, multiple matches refuse to guess and list candidates.',
+            },
             params: {
               type: 'object',
               description:
@@ -1869,9 +1945,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args, exec) {
-          const connection = await resolveRuntimeConnection(store, args && args.connection)
-          const jenkins = createJenkins(connection)
-          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const { connection, jenkins, job } = await resolveJobEverywhere(store, args && args.connection, args && args.job)
           const previousNumber = job.lastBuild && typeof job.lastBuild.number === 'number' ? job.lastBuild.number : 0
           const result = await jenkins.triggerBuild(job.url, args && args.params)
           // Only agent-initiated builds get failure analysis: the analysis is
@@ -1905,7 +1979,11 @@ export function apply(ctx, config) {
         parameters: {
           type: 'object',
           properties: {
-            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            job: {
+              type: 'string',
+              description:
+                'Job name, folder path such as folder/job, or a trailing part of the name. When `connection` is omitted the job is looked up across ALL configured connections in parallel: a unique match is used directly, multiple matches refuse to guess and list candidates.',
+            },
             build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to use the last completed build.' },
             lines: { type: 'integer', minimum: 20, maximum: 1000, description: 'How many trailing log lines to return. Defaults to 200.' },
             connection: connectionParam,
@@ -1915,9 +1993,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = await resolveRuntimeConnection(store, args && args.connection)
-          const jenkins = createJenkins(connection)
-          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const { connection, jenkins, job } = await resolveJobEverywhere(store, args && args.connection, args && args.job)
           const lines = Math.min(Math.max(Number(args && args.lines) || analysisOf(store.state).logTailLines, 20), 1000)
           let buildUrl = ''
           const wanted = args && typeof args.build === 'number' ? args.build : null
@@ -1952,7 +2028,11 @@ export function apply(ctx, config) {
         parameters: {
           type: 'object',
           properties: {
-            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            job: {
+              type: 'string',
+              description:
+                'Job name, folder path such as folder/job, or a trailing part of the name. When `connection` is omitted the job is looked up across ALL configured connections in parallel: a unique match is used directly, multiple matches refuse to guess and list candidates.',
+            },
             build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to abort the job’s current in-progress build.' },
             connection: connectionParam,
           },
@@ -1961,9 +2041,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = await resolveRuntimeConnection(store, args && args.connection)
-          const jenkins = createJenkins(connection)
-          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const { connection, jenkins, job } = await resolveJobEverywhere(store, args && args.connection, args && args.job)
           let buildUrl = ''
           const wanted = args && typeof args.build === 'number' ? args.build : null
           if (wanted) {
@@ -1985,7 +2063,11 @@ export function apply(ctx, config) {
         parameters: {
           type: 'object',
           properties: {
-            job: { type: 'string', description: 'Job name, folder path such as folder/job, or a trailing part of the name.' },
+            job: {
+              type: 'string',
+              description:
+                'Job name, folder path such as folder/job, or a trailing part of the name. When `connection` is omitted the job is looked up across ALL configured connections in parallel: a unique match is used directly, multiple matches refuse to guess and list candidates.',
+            },
             build: { type: 'integer', minimum: 1, description: 'Build number. Omit it to use the last completed build.' },
             connection: connectionParam,
           },
@@ -1994,9 +2076,7 @@ export function apply(ctx, config) {
         },
         output: textOutput,
         async execute(args) {
-          const connection = await resolveRuntimeConnection(store, args && args.connection)
-          const jenkins = createJenkins(connection)
-          const job = resolveJob(await jenkins.listJobs(), args && args.job)
+          const { connection, jenkins, job } = await resolveJobEverywhere(store, args && args.connection, args && args.job)
           let buildUrl = ''
           const wanted = args && typeof args.build === 'number' ? args.build : null
           if (wanted) {
